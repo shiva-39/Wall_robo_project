@@ -1,0 +1,44 @@
+{
+  "source_filename": "document.pdf",
+  "_meta": {
+    "ocr_used": false
+  },
+  "extracted": {
+    "invoice_number": null,
+    "invoice_date": "2024-11-11",
+    "total": 205481,
+    "items": [
+      {
+        "description": "H/No",
+        "qty": 1,
+        "unit_price": 59,
+        "raw": "H/No 1 59/9, M.S.R.Y Nilayam, 4th floor,"
+      }
+    ]
+  },
+  "customers": [],
+  "products": [
+    {
+      "id": "p_1",
+      "name": "H/No",
+      "sku": null,
+      "price": 59
+    }
+  ],
+  "invoices": [
+    {
+      "id": "inv_1761902143513",
+      "invoice_number": null,
+      "invoice_date": "2024-11-11",
+      "total": 205481,
+      "line_items": [
+        {
+          "id": "li_1",
+          "description": "H/No",
+          "qty": 1,
+          "unit_price": 59
+        }
+      ]
+    }
+  ]
+}

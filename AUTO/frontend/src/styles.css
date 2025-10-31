@@ -1,0 +1,12 @@
+body{font-family: Arial, Helvetica, sans-serif; margin:20px}
+.app header h1{margin:0 0 16px}
+.upload-panel{margin-bottom:16px}
+.upload-panel .status{margin-top:8px;color:#333}
+.tabs nav button{margin-right:8px}
+table.data{width:100%;border-collapse:collapse;margin-top:12px}
+table.data th, table.data td{border:1px solid #ddd;padding:8px}
+input{width:100%;box-sizing:border-box}
+
+.invalid{border:2px solid #e44}
+.row-missing{background: #fff4f4}
+.hint{margin-top:8px;color:#666}

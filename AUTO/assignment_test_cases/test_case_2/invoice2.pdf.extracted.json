@@ -1,0 +1,62 @@
+{
+  "source_filename": "invoice2.pdf",
+  "_meta": {
+    "ocr_used": false
+  },
+  "extracted": {
+    "invoice_number": null,
+    "invoice_date": "2024-11-11",
+    "total": 106400,
+    "items": [
+      {
+        "description": "CGST 9.0%",
+        "qty": 1,
+        "unit_price": 8115.25,
+        "raw": "CGST 9.0%        8,115.25"
+      },
+      {
+        "description": "SGST 9.0%",
+        "qty": 1,
+        "unit_price": 8115.25,
+        "raw": "SGST 9.0%        8,115.25"
+      }
+    ]
+  },
+  "customers": [],
+  "products": [
+    {
+      "id": "p_1",
+      "name": "CGST 9.0%",
+      "sku": null,
+      "price": 8115.25
+    },
+    {
+      "id": "p_2",
+      "name": "SGST 9.0%",
+      "sku": null,
+      "price": 8115.25
+    }
+  ],
+  "invoices": [
+    {
+      "id": "inv_1761902137945",
+      "invoice_number": null,
+      "invoice_date": "2024-11-11",
+      "total": 106400,
+      "line_items": [
+        {
+          "id": "li_1",
+          "description": "CGST 9.0%",
+          "qty": 1,
+          "unit_price": 8115.25
+        },
+        {
+          "id": "li_2",
+          "description": "SGST 9.0%",
+          "qty": 1,
+          "unit_price": 8115.25
+        }
+      ]
+    }
+  ]
+}

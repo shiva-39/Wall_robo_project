@@ -1,0 +1,44 @@
+{
+  "source_filename": "INV-54CZS_Test_Assam_e0MEaCdY1Mr.pdf",
+  "_meta": {
+    "ocr_used": false
+  },
+  "extracted": {
+    "invoice_number": "erf-1",
+    "invoice_date": "2024-11-03",
+    "total": 3070343.3,
+    "items": [
+      {
+        "description": "H/No",
+        "qty": 1,
+        "unit_price": 59,
+        "raw": "H/No 1 59/9, M.S.R.Y Nilayam, 4th floor,"
+      }
+    ]
+  },
+  "customers": [],
+  "products": [
+    {
+      "id": "p_1",
+      "name": "H/No",
+      "sku": null,
+      "price": 59
+    }
+  ],
+  "invoices": [
+    {
+      "id": "inv_1761902148383",
+      "invoice_number": "erf-1",
+      "invoice_date": "2024-11-03",
+      "total": 3070343.3,
+      "line_items": [
+        {
+          "id": "li_1",
+          "description": "H/No",
+          "qty": 1,
+          "unit_price": 59
+        }
+      ]
+    }
+  ]
+}
