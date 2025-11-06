@@ -21,131 +21,111 @@ Advanced backend system for autonomous wall-finishing robots with intelligent pa
 
 ### 1. Installation
 
-Clone/extract the project
-cd wall_robot_project
+# 🤖 Wall-Finishing Robot Control System
 
-Create virtual environment
+A compact FastAPI-based backend and simple frontend for planning coverage trajectories for a wall-finishing robot. The project includes a planner, a small REST API, SQLite persistence, a static Canvas UI, and tests.
+
+## Features
+
+- Optimized coverage planner (boustrophedon-like) with rectangular obstacle avoidance
+- FastAPI backend with request timing middleware
+- SQLite persistence with configurable PRAGMA tuning
+- Static HTML/JS frontend for visualizing plans
+- Pytest-based test suite
+
+## Requirements
+
+- Python 3.9+ (3.10/3.11 recommended)
+- pip
+
+## Quick start (Windows PowerShell)
+
+1. Create and activate a venv
+
+```powershell
 python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
 
-Activate virtual environment
-On Windows:
-venv\Scripts\activate
+2. Install dependencies
 
-On macOS/Linux:
-source venv/bin/activate
-
-Install dependencies
+```powershell
 pip install -r requirements.txt
+```
 
-text
+3. Run the server
 
-### 2. Configuration
-
-Create a `.env` file (or use defaults):
-
-DB_PATH=robot_trajectories.db
-API_HOST=127.0.0.1
-API_PORT=8000
-CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:8000
-LOG_LEVEL=INFO
-
-text
-
-### 3. Run the Server
-
+```powershell
+# Quick run (the file includes a small runner):
 python robot_control_system.py
 
-text
-
-Or with Uvicorn directly:
-
+# Or with uvicorn (recommended while developing):
 uvicorn robot_control_system:app --reload --host 127.0.0.1 --port 8000
+```
 
-text
+4. Open the frontend
 
-### 4. Access the Application
+Open `static/index.html` in your browser or visit the server UI if static files are served.
 
-- **Web UI**: http://127.0.0.1:8000/static/index.html
-- **API Docs**: http://127.0.0.1:8000/docs
-- **Health Check**: http://127.0.0.1:8000/health
+## API (summary)
 
-## 🧪 Running Tests
+- `GET /health` — health check
+- `POST /api/v1/plan` — submit wall dimensions, tool size, margin and obstacles; returns metrics and trajectory id
+- `GET /api/v1/trajectory/{id}` — return stored trajectory (points + metrics)
+- `GET /api/v1/trajectories` — list stored trajectories
+- `DELETE /api/v1/trajectory/{id}` — delete trajectory
 
-Run all tests
-pytest test_robot_control.py -v
+Example (PowerShell/curl):
 
-Run with coverage
-pytest test_robot_control.py --cov=robot_control_system --cov-report=html
+```powershell
+curl -X POST http://127.0.0.1:8000/api/v1/plan -H "Content-Type: application/json" -d @- <<'JSON'
+{
+	"width": 5,
+	"height": 5,
+	"tool_width": 0.25,
+	"margin": 0.02,
+	"obstacles": [ { "x": 2, "y": 2, "w": 0.25, "h": 0.25 } ]
+}
+JSON
+```
 
-Run specific test
-pytest test_robot_control.py::test_create_simple_plan -v
+## Testing
 
-text
+Run tests inside the activated venv:
 
-## 📡 API Endpoints
+```powershell
+pytest -q
+```
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | Root health status |
-| GET | `/health` | Detailed health check |
-| POST | `/api/v1/plan` | Create coverage plan |
-| GET | `/api/v1/trajectory/{id}` | Retrieve trajectory |
-| GET | `/api/v1/trajectories` | List all trajectories |
-| DELETE | `/api/v1/trajectory/{id}` | Delete trajectory |
+The test suite included in this workspace verifies API behavior, validation, and DB persistence.
 
-## 🎯 Usage Example
+## Database
 
-import requests
+The app persists trajectories to a local SQLite file `robot_trajectories.db`. This file is created on first write.
 
-Create a plan
-response = requests.post("http://127.0.0.1:8000/api/v1/plan", json={
-"wall_width": 5.0,
-"wall_height": 5.0,
-"tool_width": 0.1,
-"coverage_margin": 0.05,
-"obstacles": [
-{"id": "window-1", "x": 2.0, "y": 2.0, "width": 0.5, "height": 0.5}
-]
-})
+Configuration notes:
 
-plan_id = response.json()["id"]
-print(f"Created plan #{plan_id}")
+- PRAGMA tunables (cache_size, optional mmap_size) are configurable in `config.py` or via environment variables.
+- The project ships with sensible defaults; large mmap values are not used by default to remain portable.
 
-Retrieve the plan
-trajectory = requests.get(f"http://127.0.0.1:8000/api/v1/trajectory/{plan_id}")
-print(f"Path has {len(trajectory.json()['trajectory_points'])} points")
+## Recommended .gitignore
 
-text
+```
+venv/
+.env
+robot_trajectories.db
+__pycache__/
+.pytest_cache/
+```
 
-## 🔧 Database Optimizations
+## Development & Extras
 
-- **WAL Mode**: Write-Ahead Logging for better concurrency
-- **Composite Indexes**: Fast lookups by dimensions and timestamp
-- **Memory-Mapped I/O**: 30GB mmap for faster reads
-- **Cache Size**: 64MB cache for query performance
+- MQTT publishing is optional and disabled by default — enable via config when you have a broker.
+- If you want CI (GitHub Actions) to run tests on push/PR I can add a workflow.
 
-## 📊 Performance
+## Support
 
-- **Path Generation**: ~0.5-2 seconds for 5m x 5m wall
-- **API Response**: < 50ms for trajectory retrieval
-- **Concurrent Requests**: Supports 10+ simultaneous plan creations
-- **Database Queries**: < 10ms with indexes
-
-## 🛡️ Security
-
-- CORS configuration via environment variables
-- Input validation with Pydantic
-- SQL injection prevention (parameterized queries)
-- Request rate limiting ready (add middleware)
-
-## 📝 License
-
-MIT License - See LICENSE file
-
-## 👥 Authors
-
-Backend Intern Assignment 2025
+If you want me to further polish the README, add CI, or remove untracked artifacts from the working tree, tell me which task to perform and I will proceed.
 
 ---
-
-**Note**: This implementation demonstrates production-grade coding practices including error handling, logging, testing, and performance optimization[web:20][web:21][web:22].
+Last updated: November 7, 2025
