@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autonomous Wall Robot Planner</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f4f7f9; }
+        .card { box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); }
+        .simulation-container {
+            /* Keep visualization square and responsive */
+            width: 100%;
+            max-width: 700px;
+            margin: 0 auto;
+            aspect-ratio: 1 / 1;
+            position: relative;
+        }
+        canvas {
+            display: block;
+            border: 1px solid #e5e7eb;
+            background-color: #ffffff;
+            border-radius: 0.75rem;
+        }
+        .error-border {
+            border-color: #ef4444; /* Tailwind red-500 */
+        }
+    </style>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary-blue': '#1e40af',
+                        'secondary-green': '#059669',
+                    },
+                }
+            }
+        }
+    </script>
+</head>
+<body class="p-4 md:p-8">
+
+    <div class="max-w-7xl mx-auto space-y-8">
+        <header class="text-center">
+            <h1 class="text-4xl font-extrabold text-gray-900 mb-2">Autonomous Robot Path Planner</h1>
+            <p class="text-gray-600">Coverage Planning & Trajectory Simulation (FastAPI/SQLite Backend)</p>
+        </header>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            
+            <!-- Input Control Panel & Data Management -->
+            <div id="control-panel" class="lg:col-span-1 space-y-8">
+                
+                <!-- Wall & Obstacle Setup -->
+                <div class="p-6 bg-white rounded-xl card h-fit">
+                    <h2 class="text-xl font-semibold mb-4 text-primary-blue">Wall & Obstacle Setup (Meters)</h2>
+                    <form id="planning-form" class="space-y-4">
+                        
+                        <div>
+                            <label for="wall-width" class="block text-sm font-medium text-gray-700">Wall Width (W)</label>
+                            <input type="number" id="wall-width" value="5.0" step="0.1" min="1.0" required class="wall-input mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-blue focus:ring-primary-blue p-2 border">
+                        </div>
+                        
+                        <div>
+                            <label for="wall-height" class="block text-sm font-medium text-gray-700">Wall Height (H)</label>
+                            <input type="number" id="wall-height" value="5.0" step="0.1" min="1.0" required class="wall-input mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-blue focus:ring-primary-blue p-2 border">
+                        </div>
+                        
+                        <div>
+                            <label for="step-size" class="block text-sm font-medium text-gray-700">Roller/Step Size (S)</label>
+                            <input type="number" id="step-size" value="0.2" step="0.01" min="0.01" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-blue focus:ring-primary-blue p-2 border">
+                            <p class="text-xs text-gray-500 mt-1">Defines the distance between parallel scan lines.</p>
+                        </div>
+
+                        <h3 class="font-medium mt-6 pt-4 border-t text-gray-800">Obstacle (Example: 25cm x 25cm Window)</h3>
+                        <p id="obstacle-error" class="text-xs text-red-500 font-semibold hidden">Obstacle is out of wall bounds!</p>
+                        <p class="text-xs text-gray-500">Note: Only one obstacle is supported for this basic simulation.</p>
+                        
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label for="obs-x" class="block text-sm font-medium text-gray-700">X Position</label>
+                                <input type="number" id="obs-x" value="2.0" step="0.1" class="obs-input mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border">
+                            </div>
+                            <div>
+                                <label for="obs-y" class="block text-sm font-medium text-gray-700">Y Position</label>
+                                <input type="number" id="obs-y" value="2.0" step="0.1" class="obs-input mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border">
+                            </div>
+                            <div>
+                                <label for="obs-w" class="block text-sm font-medium text-gray-700">Width</label>
+                                <input type="number" id="obs-w" value="0.25" step="0.01" class="obs-input mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border">
+                            </div>
+                            <div>
+                                <label for="obs-h" class="block text-sm font-medium text-gray-700">Height</label>
+                                <input type="number" id="obs-h" value="0.25" step="0.01" class="obs-input mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border">
+                            </div>
+                        </div>
+                        
+                        <button type="submit" id="generate-btn" class="w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary-blue hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-blue transition duration-150 ease-in-out">
+                            Generate & Store Trajectory
+                        </button>
+                        <div id="loading-spinner" class="hidden text-center text-primary-blue font-medium mt-2">
+                            <svg class="animate-spin h-5 w-5 mr-3 inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            Planning...
+                        </div>
+                        <div id="message-box" class="mt-4 p-3 rounded-md hidden"></div>
+                    </form>
+                </div>
+
+                <!-- Database Management & Retrieval -->
+                <div class="p-6 bg-white rounded-xl card h-fit">
+                    <h2 class="text-xl font-semibold mb-4 text-secondary-green">Data Management (SQLite)</h2>
+                    
+                    <h3 class="font-medium text-gray-800 mb-2">Load by ID</h3>
+                    <div class="flex space-x-2 mb-4">
+                        <input type="number" id="load-id-input" placeholder="Trajectory ID" min="1" class="flex-grow rounded-md border-gray-300 shadow-sm p-2 border text-sm">
+                        <button id="load-id-btn" class="py-2 px-4 rounded-md shadow-sm text-sm font-medium text-white bg-secondary-green hover:bg-green-700 transition">
+                            Load
+                        </button>
+                    </div>
+
+                    <h3 class="font-medium text-gray-800 mb-2 pt-4 border-t">Recent Trajectories (Optimized Index)</h3>
+                    <button id="list-recent-btn" class="w-full py-2 px-4 rounded-md shadow-sm text-sm font-medium text-white bg-gray-500 hover:bg-gray-600 transition">
+                        List 10 Recent
+                    </button>
+                    <ul id="recent-list" class="mt-3 space-y-1 text-xs max-h-40 overflow-y-auto border p-2 rounded-md">
+                        <li class="text-gray-500">Click 'List 10 Recent' to load data...</li>
+                    </ul>
+                </div>
+                
+                <!-- Database Stats -->
+                <div class="p-6 bg-white rounded-xl card h-fit">
+                    <h2 class="text-xl font-semibold mb-4 text-primary-blue">System Health & DB Stats</h2>
+                    <div id="db-stats-content" class="text-sm space-y-1">
+                        <p>Total Trajectories: <span id="stat-total" class="font-semibold text-gray-900">N/A</span></p>
+                        <p>Latest ID: <span id="stat-latest-id" class="font-semibold text-gray-900">N/A</span></p>
+                        <p class="pt-2">Avg. Plan Time: <span id="stat-avg-time" class="font-semibold text-gray-900">N/A</span> ms</p>
+                        <p>Fastest Plan: <span id="stat-min-time" class="font-semibold text-secondary-green">N/A</span> ms</p>
+                        <p>Slowest Plan: <span id="stat-max-time" class="font-semibold text-red-600">N/A</span> ms</p>
+                    </div>
+                    <button id="refresh-stats-btn" class="w-full mt-4 py-2 px-4 rounded-md shadow-sm text-sm font-medium text-white bg-gray-400 hover:bg-gray-500 transition">
+                        Refresh Stats
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Visualization and Playback -->
+            <div class="lg:col-span-2 p-6 bg-white rounded-xl card">
+                <h2 class="text-xl font-semibold mb-4 text-primary-blue">2D Simulation & Playback</h2>
+                <div class="simulation-container">
+                    <canvas id="wallCanvas" class="w-full h-full"></canvas>
+                </div>
+                
+                <!-- Playback Controls -->
+                <div class="mt-4 space-y-3">
+                    <div class="flex justify-between items-center text-sm font-medium text-gray-700">
+                        <span>Playback Speed: 1x</span>
+                        <span id="current-time">Time: 0.0s</span>
+                    </div>
+                    <input type="range" id="playback-slider" value="0" min="0" max="100" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer range-lg">
+                    <div class="flex justify-center space-x-4 pt-2">
+                        <button id="play-pause-btn" class="px-4 py-2 bg-secondary-green text-white font-medium rounded-lg shadow-md hover:bg-green-700 transition">
+                            ▶️ Play
+                        </button>
+                        <button id="reset-btn" class="px-4 py-2 bg-gray-500 text-white font-medium rounded-lg shadow-md hover:bg-gray-600 transition">
+                            🔄 Reset
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Metrics and Explanation -->
+                <div id="metrics" class="mt-6 border-t pt-4 space-y-2 text-sm">
+                    <h3 class="font-semibold text-gray-800">Planning & Trajectory Info:</h3>
+                    <p id="trajectory-id">Trajectory ID: N/A</p>
+                    <p id="wall-dims">Wall Size: N/A</p>
+                    <p id="process-time">Backend Planning Time: N/A</p>
+                    <p id="total-points">Total Path Points: N/A</p>
+                    <p id="path-explanation" class="text-sm italic text-gray-600 border-l-4 border-primary-blue pl-3 mt-3">
+                        Path Planning Explanation: The robot uses a Boustrophedon (Raster Scan) algorithm. It traverses the wall in parallel, overlapping lines (step size S), switching direction on each pass (like mowing a lawn) to ensure full coverage while navigating around obstacles.
+                    </p>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://127.0.0.1:8000';
+
+        // --- DOM Elements ---
+        const canvas = document.getElementById('wallCanvas');
+        const ctx = canvas.getContext('2d');
+        const form = document.getElementById('planning-form');
+        const generateBtn = document.getElementById('generate-btn');
+        const messageBox = document.getElementById('message-box');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        const playbackSlider = document.getElementById('playback-slider');
+        const playPauseBtn = document.getElementById('play-pause-btn');
+        const resetBtn = document.getElementById('reset-btn');
+        const currentTimeSpan = document.getElementById('current-time');
+        
+        // Input elements for validation
+        const wallWidthInput = document.getElementById('wall-width');
+        const wallHeightInput = document.getElementById('wall-height');
+        const obsXInput = document.getElementById('obs-x');
+        const obsYInput = document.getElementById('obs-y');
+        const obsWInput = document.getElementById('obs-w');
+        const obsHInput = document.getElementById('obs-h');
+        const obstacleErrorSpan = document.getElementById('obstacle-error');
+
+        // New elements for Data Management
+        const loadIdInput = document.getElementById('load-id-input');
+        const loadIdBtn = document.getElementById('load-id-btn');
+        const listRecentBtn = document.getElementById('list-recent-btn');
+        const recentList = document.getElementById('recent-list');
+        const refreshStatsBtn = document.getElementById('refresh-stats-btn');
+
+        // New Stats elements
+        const statTotal = document.getElementById('stat-total');
+        const statLatestId = document.getElementById('stat-latest-id');
+        const statAvgTime = document.getElementById('stat-avg-time');
+        const statMinTime = document.getElementById('stat-min-time');
+        const statMaxTime = document.getElementById('stat-max-time');
+
+
+        // --- State Variables ---
+        let trajectoryData = null;
+        let isPlaying = false;
+        let animationFrameId = null;
+        let lastTimestamp = 0;
+        let startTime = 0;
+        let totalPathTime = 0;
+        let maxCanvasDim = 0;
+        const CANVAS_PADDING = 30; // pixels
+
+        // --- Input Validation Logic ---
+
+        function validateObstaclePlacement() {
+            const wallWidth = parseFloat(wallWidthInput.value);
+            const wallHeight = parseFloat(wallHeightInput.value);
+            const obsX = parseFloat(obsXInput.value);
+            const obsY = parseFloat(obsYInput.value);
+            const obsW = parseFloat(obsWInput.value);
+            const obsH = parseFloat(obsHInput.value);
+
+            if (isNaN(wallWidth) || isNaN(wallHeight) || isNaN(obsX) || isNaN(obsY) || isNaN(obsW) || isNaN(obsH)) {
+                // If any input is not a number, let the browser's 'required' handle it
+                return true; 
+            }
+
+            // Check if obstacle is outside the wall boundaries (0, 0) to (W, H)
+            const isOutOfXBounds = obsX < 0 || obsX + obsW > wallWidth;
+            const isOutOfYBounds = obsY < 0 || obsY + obsH > wallHeight;
+
+            const isInvalid = isOutOfXBounds || isOutOfYBounds;
+
+            if (isInvalid) {
+                obstacleErrorSpan.classList.remove('hidden');
+                generateBtn.disabled = true;
+                generateBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                
+                // Add error styling to the relevant fields
+                if (isOutOfXBounds) { obsXInput.classList.add('error-border'); obsWInput.classList.add('error-border'); }
+                if (isOutOfYBounds) { obsYInput.classList.add('error-border'); obsHInput.classList.add('error-border'); }
+                
+                // Clear all metrics and visualization to prevent confusion
+                clearCanvas();
+                drawWall(wallWidth, wallHeight);
+                showMessage("Input error: Obstacle must be entirely within the wall.", true);
+                
+                return false;
+            } else {
+                obstacleErrorSpan.classList.add('hidden');
+                generateBtn.disabled = false;
+                generateBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                
+                // Remove error styling
+                document.querySelectorAll('.obs-input, .wall-input').forEach(input => {
+                    input.classList.remove('error-border');
+                });
+                
+                // Clear messages if validation passes but nothing is generated yet
+                if (!trajectoryData) messageBox.classList.add('hidden'); 
+
+                return true;
+            }
+        }
+
+        // --- Visualization & Utility Functions (Rest of the code remains the same) ---
+
+        function showMessage(message, isError = false) {
+            messageBox.textContent = message;
+            messageBox.classList.remove('hidden', 'bg-red-100', 'text-red-800', 'bg-green-100', 'text-green-800');
+            if (isError) {
+                messageBox.classList.add('bg-red-100', 'text-red-800');
+            } else {
+                messageBox.classList.add('bg-green-100', 'text-green-800');
+            }
+        }
+
+        function clearCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function coordinateToCanvas(x, y, W, H) {
+            const scale = (maxCanvasDim - 2 * CANVAS_PADDING) / Math.max(W, H);
+
+            let cx = CANVAS_PADDING + x * scale;
+            let cy = CANVAS_PADDING + (H - y) * scale;
+            
+            if (H > W) {
+                const offsetX = ((maxCanvasDim - 2 * CANVAS_PADDING) - W * scale) / 2;
+                cx += offsetX;
+            } else if (W > H) {
+                const offsetY = ((maxCanvasDim - 2 * CANVAS_PADDING) - H * scale) / 2;
+                cy += offsetY;
+            }
+
+            return { cx, cy, scale };
+        }
+
+        function drawWall(W, H) {
+            clearCanvas();
+            const { cx: x0, cy: yH, scale } = coordinateToCanvas(0, 0, W, H);
+            const W_px = W * scale;
+            const H_px = H * scale;
+
+            // Draw Wall Boundary
+            ctx.strokeStyle = '#374151';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x0, yH - H_px, W_px, H_px);
+
+            // Draw labels
+            ctx.fillStyle = '#374151';
+            ctx.font = '14px Inter';
+            ctx.textAlign = 'center';
+            ctx.fillText(`${W.toFixed(1)} m (Width)`, x0 + W_px / 2, yH + 20);
+            ctx.textAlign = 'left';
+            ctx.save();
+            ctx.translate(x0 - 20, yH - H_px / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.fillText(`${H.toFixed(1)} m (Height)`, 0, 0);
+            ctx.restore();
+        }
+
+        function drawObstacles(obstacles, W, H) {
+            ctx.fillStyle = '#dc2626'; // Red for obstacles
+            obstacles.forEach(obs => {
+                const { cx: x, cy: y, scale } = coordinateToCanvas(obs.x, obs.y + obs.height, W, H); 
+                const w_px = obs.width * scale;
+                const h_px = obs.height * scale;
+                ctx.fillRect(x, y, w_px, h_px);
+                
+                // Label the obstacle
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '10px Inter';
+                ctx.textAlign = 'center';
+                ctx.fillText('OBS', x + w_px / 2, y + h_px / 2 + 4);
+            });
+        }
+
+        function drawPath(path, W, H, stepSize, progressIndex = path.length) {
+            if (!path || path.length < 2) return;
+
+            // Draw Full Path (Faded)
+            ctx.beginPath();
+            ctx.strokeStyle = 'rgba(30, 64, 175, 0.2)'; // Faded primary-blue
+            ctx.lineWidth = 1;
+            let start = coordinateToCanvas(path[0].x, path[0].y, W, H);
+            ctx.moveTo(start.cx, start.cy);
+            for (let i = 1; i < path.length; i++) {
+                let next = coordinateToCanvas(path[i].x, path[i].y, W, H);
+                ctx.lineTo(next.cx, next.cy);
+            }
+            ctx.stroke();
+            
+            // Draw Traveled Path (Solid)
+            ctx.beginPath();
+            ctx.strokeStyle = '#1e40af'; // Solid primary-blue
+            ctx.lineWidth = 2;
+            ctx.moveTo(start.cx, start.cy);
+            for (let i = 1; i < progressIndex; i++) {
+                let next = coordinateToCanvas(path[i].x, path[i].y, W, H);
+                ctx.lineTo(next.cx, next.cy);
+            }
+            ctx.stroke();
+
+            // Draw Robot Marker at current position
+            if (progressIndex > 0) {
+                const currentPoint = path[progressIndex - 1];
+                const { cx, cy, scale } = coordinateToCanvas(currentPoint.x, currentPoint.y, W, H);
+                
+                // Draw Robot circle
+                ctx.beginPath();
+                ctx.fillStyle = '#059669'; // Secondary-green
+                ctx.arc(cx, cy, 6, 0, 2 * Math.PI);
+                ctx.fill();
+                
+                // Draw roller/step size visualization
+                const rollerRadius = (stepSize * scale) / 2;
+                ctx.strokeStyle = '#059669';
+                ctx.lineWidth = 1;
+                ctx.globalAlpha = 0.5;
+                ctx.beginPath();
+                ctx.arc(cx, cy, rollerRadius, 0, 2 * Math.PI);
+                ctx.stroke();
+                ctx.globalAlpha = 1.0;
+            }
+        }
+
+        function renderVisualization(data, timeProgress = 0) {
+            const W = data.wall_width;
+            const H = data.wall_height;
+            const stepSize = data.step_size;
+            const obstacles = data.obstacles;
+            const path = data.trajectory;
+            
+            drawWall(W, H);
+            drawObstacles(obstacles, W, H);
+
+            let progressIndex = path.findIndex(p => p.t >= timeProgress);
+            if (progressIndex === -1) progressIndex = path.length;
+
+            drawPath(path, W, H, stepSize, progressIndex);
+        }
+
+        function updateMetrics(data) {
+            const totalPathPoints = data.trajectory.length;
+            totalPathTime = data.trajectory.length > 0 ? data.trajectory[data.trajectory.length - 1].t : 0;
+
+            document.getElementById('trajectory-id').textContent = `Trajectory ID: ${data.id}`;
+            document.getElementById('wall-dims').textContent = `Wall Size: ${data.wall_width}m x ${data.wall_height}m (Step: ${data.step_size}m)`;
+            document.getElementById('process-time').textContent = `Backend Planning Time: ${data.process_time_ms.toFixed(2)} ms`;
+            document.getElementById('total-points').textContent = `Total Path Points: ${totalPathPoints}`;
+            
+            resetPlayback();
+        }
+
+        // --- Playback/Animation Logic ---
+
+        function animate(timestamp) {
+            if (!isPlaying || !trajectoryData) {
+                cancelAnimationFrame(animationFrameId);
+                return;
+            }
+
+            if (!lastTimestamp) lastTimestamp = timestamp;
+            
+            const elapsed = (timestamp - lastTimestamp) / 1000; 
+            lastTimestamp = timestamp;
+
+            startTime += elapsed; 
+            const currentSimTime = Math.min(startTime, totalPathTime);
+
+            playbackSlider.value = (currentSimTime / totalPathTime) * 100;
+            currentTimeSpan.textContent = `Time: ${currentSimTime.toFixed(2)}s / ${totalPathTime.toFixed(2)}s`;
+
+            renderVisualization(trajectoryData, currentSimTime);
+
+            if (currentSimTime >= totalPathTime) {
+                isPlaying = false;
+                playPauseBtn.textContent = '▶️ Play';
+                cancelAnimationFrame(animationFrameId);
+            } else {
+                animationFrameId = requestAnimationFrame(animate);
+            }
+        }
+
+        function togglePlayback() {
+            if (!trajectoryData) {
+                showMessage("Please generate or load a trajectory first.", true);
+                return;
+            }
+            if (isPlaying) {
+                isPlaying = false;
+                playPauseBtn.textContent = '▶️ Play';
+                cancelAnimationFrame(animationFrameId);
+            } else {
+                if (startTime >= totalPathTime) {
+                    resetPlayback();
+                }
+                isPlaying = true;
+                playPauseBtn.textContent = '⏸️ Pause';
+                lastTimestamp = 0; 
+                animationFrameId = requestAnimationFrame(animate);
+            }
+        }
+
+        function resetPlayback() {
+            isPlaying = false;
+            cancelAnimationFrame(animationFrameId);
+            playPauseBtn.textContent = '▶️ Play';
+            startTime = 0;
+            playbackSlider.value = 0;
+            if (trajectoryData) {
+                renderVisualization(trajectoryData, 0); 
+                currentTimeSpan.textContent = `Time: 0.00s / ${totalPathTime.toFixed(2)}s`;
+            }
+        }
+
+        function handleSliderChange(event) {
+            if (!trajectoryData) return;
+            const percentage = event.target.value / 100;
+            startTime = percentage * totalPathTime;
+            
+            if (isPlaying) {
+                 isPlaying = false;
+                 playPauseBtn.textContent = '▶️ Play';
+                 cancelAnimationFrame(animationFrameId);
+            }
+
+            renderVisualization(trajectoryData, startTime);
+            currentTimeSpan.textContent = `Time: ${startTime.toFixed(2)}s / ${totalPathTime.toFixed(2)}s`;
+        }
+        
+        // --- API & Data Management ---
+
+        async function fetchApi(url, method = 'GET', body = null) {
+            const options = {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+            };
+            if (body) {
+                options.body = JSON.stringify(body);
+            }
+
+            try {
+                const response = await fetch(url, options);
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.detail || `API Error: ${response.status} ${response.statusText}`);
+                }
+                return data;
+            } catch (error) {
+                console.error("API Call failed:", error);
+                throw new Error(`API Error: ${error.message}.`);
+            }
+        }
+
+        async function handleGenerate(event) {
+            event.preventDefault();
+            
+            // Re-validate just before submission
+            if (!validateObstaclePlacement()) {
+                showMessage("Please fix the obstacle placement error before generating.", true);
+                return;
+            }
+
+            const wallWidth = parseFloat(wallWidthInput.value);
+            const wallHeight = parseFloat(wallHeightInput.value);
+            const stepSize = parseFloat(document.getElementById('step-size').value);
+            
+            const obsX = parseFloat(obsXInput.value);
+            const obsY = parseFloat(obsYInput.value);
+            const obsW = parseFloat(obsWInput.value);
+            const obsH = parseFloat(obsHInput.value);
+
+            const requestData = {
+                wall_width: wallWidth,
+                wall_height: wallHeight,
+                step_size: stepSize,
+                obstacles: [{ x: obsX, y: obsY, width: obsW, height: obsH }]
+            };
+
+            resetPlayback();
+            trajectoryData = null;
+            messageBox.classList.add('hidden');
+            loadingSpinner.classList.remove('hidden');
+            generateBtn.disabled = true;
+
+            try {
+                const data = await fetchApi(`${API_BASE_URL}/generate`, 'POST', requestData);
+                
+                trajectoryData = data;
+                updateMetrics(data);
+                renderVisualization(trajectoryData, 0); 
+                
+                showMessage(`Trajectory ID ${data.id} successfully generated and stored. Total path time: ${totalPathTime.toFixed(2)}s.`);
+
+            } catch (error) {
+                showMessage(`Error: ${error.message}. Ensure the FastAPI server is running.`, true);
+            } finally {
+                loadingSpinner.classList.add('hidden');
+                generateBtn.disabled = false;
+                await updateDbStats();
+            }
+        }
+
+        async function handleLoadById() {
+            const id = parseInt(loadIdInput.value);
+            if (isNaN(id) || id <= 0) {
+                showMessage("Please enter a valid Trajectory ID.", true);
+                return;
+            }
+
+            resetPlayback();
+            trajectoryData = null;
+            messageBox.classList.add('hidden');
+            loadIdBtn.disabled = true;
+
+            try {
+                const data = await fetchApi(`${API_BASE_URL}/trajectory/${id}`);
+                
+                trajectoryData = data;
+                updateMetrics(data);
+                renderVisualization(trajectoryData, 0);
+                showMessage(`Trajectory ID ${data.id} successfully loaded.`);
+
+            } catch (error) {
+                showMessage(`Failed to load Trajectory ID ${id}. ${error.message}`, true);
+            } finally {
+                loadIdBtn.disabled = false;
+            }
+        }
+
+        async function handleListRecent() {
+            recentList.innerHTML = '<li class="text-primary-blue">Loading...</li>';
+            try {
+                const data = await fetchApi(`${API_BASE_URL}/trajectories/recent`);
+                
+                recentList.innerHTML = '';
+                if (data.length === 0) {
+                    recentList.innerHTML = '<li class="text-gray-500">No trajectories found.</li>';
+                } else {
+                    data.forEach(item => {
+                        const li = document.createElement('li');
+                        li.className = 'cursor-pointer hover:bg-gray-100 p-1 rounded transition duration-150';
+                        li.innerHTML = `<strong>ID ${item.id}</strong> (${item.wall_size}) - ${item.process_time_ms.toFixed(1)}ms`;
+                        li.onclick = () => {
+                            loadIdInput.value = item.id;
+                            handleLoadById();
+                        };
+                        recentList.appendChild(li);
+                    });
+                }
+            } catch (error) {
+                recentList.innerHTML = '<li class="text-red-500">Failed to load recent list.</li>';
+                showMessage(`Error listing recent data: ${error.message}`, true);
+            }
+        }
+        
+        async function updateDbStats() {
+            try {
+                const stats = await fetchApi(`${API_BASE_URL}/db/stats`);
+                
+                statTotal.textContent = stats.total_trajectories;
+                statLatestId.textContent = stats.latest_run_id !== null ? stats.latest_run_id : 'None';
+                statAvgTime.textContent = stats.avg_process_time_ms !== null ? stats.avg_process_time_ms.toFixed(2) : 'N/A';
+                statMinTime.textContent = stats.fastest_plan_ms !== null ? stats.fastest_plan_ms.toFixed(2) : 'N/A';
+                statMaxTime.textContent = stats.slowest_plan_ms !== null ? stats.slowest_plan_ms.toFixed(2) : 'N/A';
+                
+            } catch (error) {
+                statTotal.textContent = 'Error';
+                statAvgTime.textContent = 'Error';
+            }
+        }
+
+
+        // --- Main Execution ---
+        window.addEventListener('load', () => {
+            // Attach validation listeners
+            document.querySelectorAll('.wall-input, .obs-input').forEach(input => {
+                input.addEventListener('input', () => {
+                    validateObstaclePlacement();
+                    // Also redraw wall/obstacle preview when inputs change
+                    const W = parseFloat(wallWidthInput.value) || 5.0;
+                    const H = parseFloat(wallHeightInput.value) || 5.0;
+                    drawWall(W, H);
+                    
+                    if (validateObstaclePlacement()) {
+                        drawObstacles([{
+                            x: parseFloat(obsXInput.value),
+                            y: parseFloat(obsYInput.value),
+                            width: parseFloat(obsWInput.value),
+                            height: parseFloat(obsHInput.value)
+                        }], W, H);
+                    }
+                });
+            });
+
+            resizeCanvas();
+            // Initial drawing of the default configuration, running validation checks
+            validateObstaclePlacement();
+
+            window.addEventListener('resize', resizeCanvas);
+            form.addEventListener('submit', handleGenerate);
+            playPauseBtn.addEventListener('click', togglePlayback);
+            resetBtn.addEventListener('click', resetPlayback);
+            playbackSlider.addEventListener('input', handleSliderChange);
+
+            // New Data Management Event Listeners
+            loadIdBtn.addEventListener('click', handleLoadById);
+            listRecentBtn.addEventListener('click', handleListRecent);
+            refreshStatsBtn.addEventListener('click', updateDbStats);
+            
+            // Fetch initial stats when the page loads
+            updateDbStats();
+        });
+
+        function resizeCanvas() {
+            const container = document.querySelector('.simulation-container');
+            const size = Math.min(container.clientWidth, container.clientHeight);
+            canvas.width = size;
+            canvas.height = size;
+            maxCanvasDim = size;
+
+            if (trajectoryData) {
+                renderVisualization(trajectoryData, startTime);
+            } else {
+                // Draw initial wall outline when data is missing
+                const W = parseFloat(wallWidthInput.value) || 5.0;
+                const H = parseFloat(wallHeightInput.value) || 5.0;
+                drawWall(W, H);
+
+                // Draw obstacle preview if valid
+                if (validateObstaclePlacement()) {
+                    drawObstacles([{
+                        x: parseFloat(obsXInput.value),
+                        y: parseFloat(obsYInput.value),
+                        width: parseFloat(obsWInput.value),
+                        height: parseFloat(obsHInput.value)
+                    }], W, H);
+                }
+            }
+        }
+
+    </script>
+</body>
+</html>
