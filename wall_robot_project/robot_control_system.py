@@ -9,12 +9,15 @@ import json
 import logging
 import time
 from decimal import Decimal, getcontext
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Callable
+from fastapi import WebSocket
 from datetime import datetime, timezone # <--- CORRECTION: Added timezone
 from contextlib import asynccontextmanager
+from fastapi import WebSocket
 
 
 from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 from config import get_settings, Settings
+import jwt
+from jwt import PyJWTError
 
 
 # --- CONFIGURATION & INITIALIZATION ---
@@ -130,6 +135,74 @@ def _require_api_key(request: Request):
         raise HTTPException(status_code=401, detail='Unauthorized')
 
     return True
+
+
+security = HTTPBearer(auto_error=False)
+
+
+def _verify_jwt_token(token: str) -> bool:
+    """Verify JWT token using settings.jwt_secret if configured."""
+    secret = getattr(settings, 'jwt_secret', '')
+    if not secret:
+        return False
+    try:
+        payload = jwt.decode(token, secret, algorithms=['HS256'])
+        return True
+    except PyJWTError:
+        return False
+
+
+def require_auth(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    """Dependency to require either API key or valid JWT.
+
+    Priority: API key via X-API-Key or Authorization: Bearer <key> matching settings.api_key.
+    Otherwise, accept JWT if settings.jwt_secret is configured and token verifies.
+    """
+    # First try API key
+    try:
+        return _require_api_key(request)
+    except HTTPException:
+        # Try JWT
+        pass
+
+    # If a bearer token is present and jwt_secret configured, verify it
+    if credentials and credentials.scheme.lower() == 'bearer':
+        token = credentials.credentials
+        if _verify_jwt_token(token):
+            return True
+
+    raise HTTPException(status_code=401, detail='Unauthorized')
+
+
+def rate_limit_decorator(limit_spec: str):
+    """Return a decorator that applies rate limiting when Redis limiter is configured.
+
+    If no Redis limiter is configured, returns identity decorator.
+    """
+    limiter_obj = getattr(app.state, 'limiter', None)
+    if limiter_obj is None:
+        def _identity(fn):
+            return fn
+        return _identity
+    return limiter_obj.limit(limit_spec)
+
+
+# Optional Redis-backed rate limiter (uses slowapi). Enabled when `settings.redis_url` is set.
+if getattr(settings, 'redis_url', ''):
+    try:
+        from slowapi import Limiter
+        from slowapi.util import get_remote_address
+        from slowapi.errors import RateLimitExceeded
+        from slowapi.middleware import SlowAPIMiddleware
+        from slowapi.errors import _rate_limit_exceeded_handler
+
+        limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url)
+        app.state.limiter = limiter
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        app.add_middleware(SlowAPIMiddleware)
+        logger.info(f"[OK] Redis-backed rate limiter initialized (redis: {settings.redis_url})")
+    except Exception as e:
+        logger.warning(f"[WARN] Could not initialize Redis rate limiter: {e}")
 
 
 
@@ -355,6 +428,9 @@ def init_db():
         def _maintenance_loop():
             conn = get_db_connection()
             try:
+                last_vacuum = time.time()
+                checkpoint_interval = getattr(settings, 'checkpoint_interval_seconds', 300)
+                vacuum_interval = getattr(settings, 'vacuum_interval_seconds', 3600)
                 while True:
                     try:
                         # WAL checkpoint
@@ -362,8 +438,20 @@ def init_db():
                         conn.commit()
                     except Exception:
                         pass
+
+                    # Periodic VACUUM (infrequent, heavy operation)
+                    now_t = time.time()
+                    if vacuum_interval and (now_t - last_vacuum) >= vacuum_interval:
+                        try:
+                            conn.execute('VACUUM')
+                            conn.commit()
+                            last_vacuum = now_t
+                            logger.info('[MAINT] Performed VACUUM')
+                        except Exception:
+                            pass
+
                     # Sleep for the configured interval
-                    time.sleep(getattr(settings, 'checkpoint_interval_seconds', 300))
+                    time.sleep(checkpoint_interval)
             finally:
                 conn.close()
 
@@ -445,10 +533,13 @@ def calculate_path_metrics(path: List[List[float]], wall_area: float) -> PathMet
 
 
 
-def generate_coverage_path(plan: WallPlanRequest) -> tuple[List[List[float]], PathMetrics]:
+def generate_coverage_path(plan: WallPlanRequest, progress_callback: Optional[Callable[[int, int], None]] = None) -> tuple[List[List[float]], PathMetrics]:
     """
     Generate optimized boustrophedon (snake) coverage path.
     Returns trajectory points and metrics.
+    Optional `progress_callback(percent:int, points:int)` is called from the
+    planner thread to report progress; the callback must be thread-safe or
+    schedule into the event loop (e.g., loop.call_soon_threadsafe).
     """
     try:
         # Ensure all values are Decimals
@@ -456,45 +547,132 @@ def generate_coverage_path(plan: WallPlanRequest) -> tuple[List[List[float]], Pa
         H = plan.wall_height if isinstance(plan.wall_height, Decimal) else Decimal(str(plan.wall_height))
         T = plan.tool_width if isinstance(plan.tool_width, Decimal) else Decimal(str(plan.tool_width))
         M = plan.coverage_margin if isinstance(plan.coverage_margin, Decimal) else Decimal(str(plan.coverage_margin))
-        
+
         obstacles = plan.obstacles
-        
+
         step_x = T * Decimal("0.9")  # 10% overlap for better coverage
         tool_half = T / Decimal("2.0")
-        
-        path = []
+
+        path: List[List[float]] = []
         current_x = M + tool_half
-        
+        total_width = float((W - M - tool_half) - (M + tool_half)) if (W - 2*M - tool_half*2) > 0 else 0.0
+        point_counter = 0
+
         while current_x < W - M - tool_half:
             # Alternate direction for snake pattern
-            if len([p for p in path if abs(p[0] - float(current_x)) < 0.001]) % 2 == 0:
+            col_points = [p for p in path if abs(p[0] - float(current_x)) < 0.001]
+            if len(col_points) % 2 == 0:
                 # Bottom to top
-                y_range = (M + tool_half, H - M - tool_half, step_x / Decimal("4.0"))
+                y_start, y_end, dy = (M + tool_half, H - M - tool_half, step_x / Decimal("4.0"))
             else:
                 # Top to bottom
-                y_range = (H - M - tool_half, M + tool_half, -step_x / Decimal("4.0"))
-            
-            current_y = y_range[0]
-            end_y = y_range[1]
-            dy = y_range[2]
-            
-            while (dy > 0 and current_y <= end_y) or (dy < 0 and current_y >= end_y):
+                y_start, y_end, dy = (H - M - tool_half, M + tool_half, -step_x / Decimal("4.0"))
+
+            current_y = y_start
+
+            while (dy > 0 and current_y <= y_end) or (dy < 0 and current_y >= y_end):
                 if not is_point_obstructed(current_x, current_y, obstacles, tool_half):
                     path.append([float(current_x), float(current_y)])
+                    point_counter += 1
+                    # report progress every 500 points
+                    if progress_callback and (point_counter % 500 == 0):
+                        try:
+                            percent = 0
+                            if total_width > 0:
+                                percent = int(((float(current_x) - float(M + tool_half)) / total_width) * 100)
+                                percent = max(0, min(100, percent))
+                            progress_callback(percent, point_counter)
+                        except Exception:
+                            pass
                 current_y += dy
-            
+
             current_x += step_x
-        
+
         # Calculate metrics
         wall_area = float(W * H)
         metrics = calculate_path_metrics(path, wall_area)
-        
+
         logger.info(f"[OK] Path generated: {metrics.total_points} points, {metrics.total_distance_m}m")
         return path, metrics
-        
+
     except Exception as e:
         logger.error(f"[ERROR] Path planning error: {e}")
         raise HTTPException(status_code=500, detail=f"Path planning failed: {str(e)}")
+
+
+@app.websocket("/ws/plan")
+async def websocket_plan(ws: WebSocket):
+    """WebSocket endpoint: accept a plan JSON, stream progress and final result."""
+    await ws.accept()
+    try:
+        payload = await ws.receive_json()
+    except Exception:
+        await ws.close(code=1003)
+        return
+
+    # Normalize payload keys (support both 'width' and 'wall_width')
+    if 'width' in payload and 'wall_width' not in payload:
+        payload['wall_width'] = payload.pop('width')
+    if 'height' in payload and 'wall_height' not in payload:
+        payload['wall_height'] = payload.pop('height')
+
+    # Normalize obstacles
+    obs_list = payload.get('obstacles', [])
+    normalized = []
+    for o in obs_list:
+        if 'w' in o and 'width' not in o:
+            o['width'] = o.pop('w')
+        if 'h' in o and 'height' not in o:
+            o['height'] = o.pop('h')
+        normalized.append(o)
+    payload['obstacles'] = normalized
+
+    try:
+        plan = WallPlanRequest(**payload)
+    except Exception as e:
+        await ws.send_json({"type": "error", "detail": str(e)})
+        await ws.close()
+        return
+
+    loop = asyncio.get_running_loop()
+    progress_queue: asyncio.Queue = asyncio.Queue()
+
+    # thread-safe callback to push progress into asyncio queue
+    def progress_cb(percent: int, points: int):
+        try:
+            loop.call_soon_threadsafe(progress_queue.put_nowait, {"type": "progress", "percent": percent, "points": points})
+        except Exception:
+            pass
+
+    def run_planner():
+        return generate_coverage_path(plan, progress_callback=progress_cb)
+
+    planner_future = loop.run_in_executor(None, run_planner)
+
+    try:
+        while True:
+            # wait for either planner completion or a progress item
+            done, pending = await asyncio.wait(
+                [planner_future, asyncio.create_task(progress_queue.get())],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if planner_future in done:
+                path, metrics = planner_future.result()
+                await ws.send_json({"type": "result", "metrics": metrics.model_dump(), "path_points": len(path)})
+                break
+            else:
+                for task in done:
+                    if task is not planner_future:
+                        msg = task.result()
+                        await ws.send_json(msg)
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "error", "detail": str(e)})
+        except Exception:
+            pass
+    finally:
+        await ws.close()
 
 
 
@@ -595,7 +773,8 @@ async def health_check():
 
 
 @app.post("/api/v1/plan", status_code=201, response_model=Dict[str, Any], tags=["Planning"])
-async def create_plan(plan: WallPlanRequest):
+@rate_limit_decorator("10/minute")
+async def create_plan(plan: WallPlanRequest, auth=Depends(require_auth)):
     """
     Generate and store a coverage path plan.
     
@@ -798,7 +977,8 @@ async def list_trajectories(
 
 
 @app.delete("/api/v1/trajectory/{plan_id}", status_code=204, tags=["Planning"])
-async def delete_trajectory(plan_id: int):
+@rate_limit_decorator("20/minute")
+async def delete_trajectory(plan_id: int, auth=Depends(require_auth)):
     """Delete a trajectory by ID."""
     
     def db_delete():
