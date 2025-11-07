@@ -1,0 +1,42 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_PATH=/data/robot_trajectories.db
+      - REDIS_URL=redis://redis:6379/0
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+    depends_on:
+      - redis
+      - mosquitto
+    volumes:
+      - data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:6.2
+    ports:
+      - "6379:6379"
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"
+    volumes:
+      - mosquitto_config:/mosquitto/config
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -C 1 -t '\$SYS/broker/uptime' -W 1 || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  data:
+  mosquitto_config:

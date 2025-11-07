@@ -70,10 +70,31 @@
                             <div id="obstacles-list" class="space-y-2 max-h-32 overflow-y-auto mb-3 p-2 bg-gray-50 rounded-lg">
                                 <p class="text-xs text-gray-500 text-center py-2">No obstacles yet. Click canvas to add.</p>
                             </div>
-                            <button onclick="generatePlan()" id="plan-btn" 
-                                class="w-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white p-3 rounded-xl font-bold hover:from-indigo-700 hover:to-purple-700 transition shadow-lg">
-                                🚀 GENERATE PATH
-                            </button>
+                            <div class="space-y-2">
+                                <div id="ws-progress-container" class="hidden mb-2">
+                                    <div class="text-xs text-gray-600 mb-1">Live progress</div>
+                                    <div class="w-full bg-gray-200 rounded-full h-4 overflow-hidden">
+                                        <div id="ws-progress" class="bg-indigo-600 h-4 w-0"></div>
+                                    </div>
+                                    <div class="text-xs text-gray-500 mt-1 flex justify-between"><span id="ws-progress-label">0%</span><span id="ws-progress-points">0 pts</span></div>
+                                </div>
+
+                                <div class="grid grid-cols-2 gap-2">
+                                    <button onclick="startLivePlan()" id="live-plan-btn"
+                                        class="w-full bg-yellow-500 text-white p-3 rounded-xl font-bold hover:bg-yellow-600 transition shadow-lg">
+                                        🌐 LIVE PLAN (WS)
+                                    </button>
+                                    <button onclick="generatePlan()" id="plan-btn"
+                                        class="w-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white p-3 rounded-xl font-bold hover:from-indigo-700 hover:to-purple-700 transition shadow-lg">
+                                        🚀 GENERATE PATH
+                                    </button>
+                                </div>
+
+                                <div class="flex space-x-2">
+                                    <button id="save-btn" class="hidden flex-1 bg-emerald-600 text-white p-2 rounded-lg" onclick="savePlan()">💾 Save plan to DB</button>
+                                    <button id="abort-ws" class="hidden flex-1 bg-red-500 text-white p-2 rounded-lg" onclick="abortWS()">✖ Abort Live</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -104,13 +125,18 @@
                     </div>
                     
                     <div class="flex items-center space-x-3">
-                        <button id="play-btn" onclick="togglePlay()" disabled
+                                            <button id="play-btn" onclick="togglePlay()" disabled
                             class="bg-emerald-500 text-white p-3 rounded-full hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition">
                             <svg id="play-icon" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.26a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                             <svg id="pause-icon" class="h-6 w-6 hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                         </button>
-                        <input type="range" id="speed" min="10" max="500" value="100" class="flex-grow">
+                        <input type="range" id="speed" min="10" max="1000" value="100" class="flex-grow">
                         <span id="speed-label" class="text-sm text-gray-700 w-16 text-right">100ms</span>
+                        <div class="ml-2 space-x-1">
+                            <button class="px-2 py-1 bg-gray-100 rounded" onclick="setSpeedPreset(50)">Fast</button>
+                            <button class="px-2 py-1 bg-gray-100 rounded" onclick="setSpeedPreset(100)">Normal</button>
+                            <button class="px-2 py-1 bg-gray-100 rounded" onclick="setSpeedPreset(300)">Slow</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -146,8 +172,9 @@
         const ctx = canvas.getContext('2d');
         
         let wallW = 5.0, wallH = 5.0, scale = 100;
-        let path = [], obstacles = [];  // Start with empty obstacles
-        let animIdx = 0, isPlaying = false, animId = null, lastTime = 0;
+    let path = [], obstacles = [];  // Start with empty obstacles
+    let fullPathLoaded = false;
+    let animIdx = 0, isPlaying = false, animId = null, lastTime = 0;
 
         // --- UTILITY FUNCTIONS ---
         
@@ -162,6 +189,21 @@
                 el.classList.remove('hidden');
                 if (type === 'success') setTimeout(() => el.classList.add('hidden'), 3000);
             }
+        }
+
+        function showSpinner(show) {
+            const el = document.getElementById('loading');
+            if (show) el.classList.remove('hidden'); else el.classList.add('hidden');
+        }
+
+        // --- SPEED PRESETS ---
+        // Set playback speed from preset buttons (ms per frame)
+        function setSpeedPreset(ms) {
+            const speedEl = document.getElementById('speed');
+            const labelEl = document.getElementById('speed-label');
+            if (!speedEl || !labelEl) return;
+            speedEl.value = String(ms);
+            labelEl.textContent = ms + 'ms';
         }
 
         // --- OBSTACLE MANAGEMENT ---
@@ -187,19 +229,38 @@
         };
 
         canvas.addEventListener('click', (e) => {
+            // Recompute current wall dimensions and canvas scale to avoid stale values
+            const currentWallW = parseFloat(document.getElementById('wall-width').value) || wallW;
+            const currentWallH = parseFloat(document.getElementById('wall-height').value) || wallH;
+
+            // Resize canvas to match aspect ratio used in draw()
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetWidth * (currentWallH / Math.max(currentWallW, 1e-6));
+            const currentScale = canvas.width / currentWallW;
+
             const rect = canvas.getBoundingClientRect();
-            const x = (e.clientX - rect.left) / scale;
-            const y = (canvas.height - (e.clientY - rect.top)) / scale;
+            // Convert click to wall coordinates (meters from bottom-left)
+            const px = e.clientX - rect.left;
+            const py = e.clientY - rect.top;
+            const x = px / currentScale;
+            const y = (canvas.height - py) / currentScale;
+
             const size = 0.5;
+            // center obstacle around click, then clamp to wall bounds
+            const ox = Math.max(0, Math.min(x - size/2, currentWallW - size));
+            const oy = Math.max(0, Math.min(y - size/2, currentWallH - size));
+
             const newObs = {
                 id: `obs-${Date.now()}`,
-                x: Math.max(0, Math.min(x - size/2, wallW - size)),
-                y: Math.max(0, Math.min(y - size/2, wallH - size)),
+                x: ox,
+                y: oy,
                 width: size,
                 height: size
             };
+
             obstacles.push(newObs);
             updateObstaclesList();
+            draw();
         });
 
         // --- DRAWING ---
@@ -251,6 +312,15 @@
                 ctx.arc(toCanvasX(rx), toCanvasY(ry), (toolW/2) * scale, 0, Math.PI * 2);
                 ctx.stroke();
             }
+            // If obstacles exist, draw semi-transparent overlay to indicate exclusion zones
+            if (obstacles.length > 0) {
+                ctx.save();
+                ctx.fillStyle = 'rgba(255,0,0,0.08)';
+                obstacles.forEach(o => {
+                    ctx.fillRect(toCanvasX(o.x), toCanvasY(o.y + o.height), o.width * scale, o.height * scale);
+                });
+                ctx.restore();
+            }
         }
 
         // --- API CALLS ---
@@ -273,6 +343,13 @@
                     height: parseFloat(o.height)
                 }))
             };
+            // Client-side validation: ensure obstacles fit within wall bounds
+            for (const o of planData.obstacles) {
+                if (o.x < 0 || o.y < 0 || (o.x + o.width) > planData.wall_width || (o.y + o.height) > planData.wall_height) {
+                    showMsg('error', `Obstacle ${o.id} is outside wall bounds. Adjust obstacle placement.`);
+                    return;
+                }
+            }
             
             document.getElementById('plan-btn').disabled = true;
             showMsg('loading', 'Generating optimal coverage path...');
@@ -298,10 +375,56 @@
                 const result = await res.json();
                 console.log('Plan created:', result);
                 
-                const trajRes = await fetch(`${API_BASE}/api/v1/trajectory/${result.id}`);
+                // Fetch trajectory metadata and the first page of points (paginated)
+                const pageSize = 10000;
+                const trajRes = await fetch(`${API_BASE}/api/v1/trajectory/${result.id}?limit=${pageSize}&offset=0`);
                 const traj = await trajRes.json();
-                
-                path = traj.trajectory_points;
+
+                // Progressive loading: fetch pages sequentially and render partial path
+                const totalPoints = traj.metrics.total_points || traj.trajectory_points.length || 0;
+                path = [];
+                fullPathLoaded = false;
+                let fetched = 0;
+                // Use initial page from metadata response
+                if (Array.isArray(traj.trajectory_points) && traj.trajectory_points.length > 0) {
+                    path = path.concat(traj.trajectory_points.map(p => [parseFloat(p[0]), parseFloat(p[1])]));
+                    fetched = path.length;
+                    draw();
+                }
+
+                showSpinner(true);
+                while (fetched < totalPoints) {
+                    const off = fetched;
+                    try {
+                        const pRes = await fetch(`${API_BASE}/api/v1/trajectory/${result.id}/points?limit=${pageSize}&offset=${off}`);
+                        if (!pRes.ok) break;
+                        const pjson = await pRes.json();
+                        if (Array.isArray(pjson.points) && pjson.points.length > 0) {
+                            path = path.concat(pjson.points.map(p => [parseFloat(p[0]), parseFloat(p[1])]));
+                            fetched += pjson.points.length;
+                            // draw partial path progressively to keep UI responsive
+                            draw();
+                        } else {
+                            break;
+                        }
+                    } catch (e) {
+                        console.warn('Failed to fetch points page', e);
+                        break;
+                    }
+                    // allow UI to breathe
+                    await new Promise(r => setTimeout(r, 10));
+                }
+                showSpinner(false);
+                fullPathLoaded = true;
+
+                // Downsample for display if too large for smooth playback
+                const MAX_DISPLAY = 8000;
+                if (path.length > MAX_DISPLAY) {
+                    const step = Math.ceil(path.length / MAX_DISPLAY);
+                    const sampled = [];
+                    for (let i = 0; i < path.length; i += step) sampled.push(path[i]);
+                    path = sampled;
+                }
                 
                 // Update metrics
                 document.getElementById('metric-points').textContent = traj.metrics.total_points.toLocaleString();
@@ -311,6 +434,8 @@
                 
                 document.getElementById('play-btn').disabled = false;
                 showMsg('success', `✅ Path #${result.id} generated successfully!`);
+                // show save button for plans created via REST
+                document.getElementById('save-btn').classList.remove('hidden');
                 
             } catch (err) {
                 console.error('Full error:', err);
@@ -319,6 +444,172 @@
                 document.getElementById('plan-btn').disabled = false;
                 draw();
             }
+        }
+
+        // --- WEBSOCKET LIVE PLAN ---
+
+        let ws = null;
+        let wsAbort = false;
+
+        async function startLivePlan() {
+            // Reset state
+            path = [];
+            animIdx = 0;
+            stopPlay();
+            wsAbort = false;
+
+            const planData = {
+                wall_width: parseFloat(document.getElementById('wall-width').value),
+                wall_height: parseFloat(document.getElementById('wall-height').value),
+                tool_width: parseFloat(document.getElementById('tool-width').value),
+                coverage_margin: parseFloat(document.getElementById('margin').value),
+                obstacles: obstacles.map(o => ({ id: o.id, x: parseFloat(o.x), y: parseFloat(o.y), width: parseFloat(o.width), height: parseFloat(o.height) }))
+            };
+
+            // UI
+            document.getElementById('live-plan-btn').disabled = true;
+            document.getElementById('abort-ws').classList.remove('hidden');
+            document.getElementById('ws-progress-container').classList.remove('hidden');
+            document.getElementById('ws-progress').style.width = '0%';
+            document.getElementById('ws-progress-label').textContent = '0%';
+            document.getElementById('ws-progress-points').textContent = '0 pts';
+
+            try {
+                ws = new WebSocket(`${API_BASE.replace('http', 'ws')}/ws/plan`);
+                ws.addEventListener('open', () => {
+                    ws.send(JSON.stringify(planData));
+                });
+
+                ws.addEventListener('message', (ev) => {
+                    try {
+                        const msg = JSON.parse(ev.data);
+                        if (msg.type === 'progress') {
+                            const pct = msg.percent || 0;
+                            const pts = msg.points || 0;
+                            document.getElementById('ws-progress').style.width = pct + '%';
+                            document.getElementById('ws-progress-label').textContent = pct + '%';
+                            document.getElementById('ws-progress-points').textContent = pts + ' pts';
+                        } else if (msg.type === 'points') {
+                            // Append received point batch to path and redraw
+                            if (Array.isArray(msg.points) && msg.points.length > 0) {
+                                // msg.points is an array of [x,y]
+                                path = path.concat(msg.points.map(p => [parseFloat(p[0]), parseFloat(p[1])]));
+                                // update point metric live
+                                document.getElementById('metric-points').textContent = path.length.toLocaleString();
+                                document.getElementById('play-btn').disabled = false;
+                                draw();
+                            }
+                        } else if (msg.type === 'result') {
+                            showMsg('success', `Live plan completed — ${msg.path_points} points`);
+                            // fetch full trajectory from REST API (server stores it only via REST flow)
+                            // but here the websocket returns path_points and metrics; try to fetch latest
+                            fetchLatestAndLoad();
+                            cleanupWS();
+                        } else if (msg.type === 'error') {
+                            showMsg('error', 'Planner error: ' + (msg.detail || 'unknown'));
+                            cleanupWS();
+                        }
+                    } catch (e) {
+                        console.error('WS message parse error', e);
+                    }
+                });
+
+                ws.addEventListener('close', () => {
+                    cleanupWS();
+                });
+
+                ws.addEventListener('error', (e) => {
+                    console.error('WebSocket error', e);
+                    showMsg('error', 'WebSocket error — see console');
+                    cleanupWS();
+                });
+
+            } catch (err) {
+                console.error('WS start failed', err);
+                showMsg('error', 'Failed to start live plan');
+                cleanupWS();
+            }
+        }
+
+        function cleanupWS() {
+            try { if (ws) ws.close(); } catch (e) {}
+            ws = null;
+            document.getElementById('live-plan-btn').disabled = false;
+            document.getElementById('abort-ws').classList.add('hidden');
+            // leave progress visible for a short while
+            setTimeout(() => document.getElementById('ws-progress-container').classList.add('hidden'), 3000);
+        }
+
+        function abortWS() {
+            wsAbort = true;
+            if (ws) {
+                try { ws.close(); } catch (e) {}
+            }
+            showMsg('error', 'Live plan aborted');
+            cleanupWS();
+        }
+
+        async function fetchLatestAndLoad() {
+            // Try to fetch the latest trajectory (best-effort)
+            try {
+                const res = await fetch(`${API_BASE}/api/v1/trajectories?limit=1&offset=0`);
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!data.plans || data.plans.length === 0) return;
+                const latest = data.plans[0];
+                // Fetch metadata + first page and then assemble points via the paginated points endpoint
+                const pageSize = 10000;
+                const trajRes = await fetch(`${API_BASE}/api/v1/trajectory/${latest.id}?limit=${pageSize}&offset=0`);
+                if (!trajRes.ok) return;
+                const traj = await trajRes.json();
+                let points = traj.trajectory_points || [];
+                const totalPoints = traj.metrics.total_points || points.length || 0;
+                if (totalPoints > points.length) {
+                    let fetched = points.length;
+                    while (fetched < totalPoints) {
+                        const off = fetched;
+                        try {
+                            const pRes = await fetch(`${API_BASE}/api/v1/trajectory/${latest.id}/points?limit=${pageSize}&offset=${off}`);
+                            if (!pRes.ok) break;
+                            const pjson = await pRes.json();
+                            if (Array.isArray(pjson.points) && pjson.points.length > 0) {
+                                points = points.concat(pjson.points.map(p => [parseFloat(p[0]), parseFloat(p[1])]));
+                                fetched += pjson.points.length;
+                            } else {
+                                break;
+                            }
+                        } catch (e) {
+                            console.warn('Failed to fetch points page', e);
+                            break;
+                        }
+                    }
+                }
+
+                // Downsample if too large
+                const MAX_DISPLAY = 5000;
+                if (points.length > MAX_DISPLAY) {
+                    const step = Math.ceil(points.length / MAX_DISPLAY);
+                    const sampled = [];
+                    for (let i = 0; i < points.length; i += step) sampled.push(points[i]);
+                    path = sampled.map(p => [parseFloat(p[0]), parseFloat(p[1])]);
+                } else {
+                    path = points.map(p => [parseFloat(p[0]), parseFloat(p[1])]);
+                }
+
+                document.getElementById('metric-points').textContent = totalPoints.toLocaleString();
+                document.getElementById('metric-distance').textContent = traj.metrics.total_distance_m + ' m';
+                document.getElementById('metric-time').textContent = traj.metrics.estimated_time_min.toFixed(1) + ' min';
+                document.getElementById('metric-coverage').textContent = traj.metrics.coverage_percentage.toFixed(1) + '%';
+                document.getElementById('play-btn').disabled = false;
+                draw();
+            } catch (e) {
+                console.warn('Could not fetch latest trajectory', e);
+            }
+        }
+
+        function savePlan() {
+            // This button appears for REST-created plans; here it's a no-op placeholder
+            showMsg('success', 'Plan already stored on server (use REST create).');
         }
 
         // --- PLAYBACK ---

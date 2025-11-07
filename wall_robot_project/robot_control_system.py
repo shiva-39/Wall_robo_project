@@ -3,17 +3,15 @@ Wall-Finishing Robot Control System - Enhanced Backend API
 Robust, optimized, database-driven system for autonomous robot path planning.
 """
 
-
 import sqlite3
 import json
 import logging
 import time
 from decimal import Decimal, getcontext
-from typing import List, Optional, Dict, Any, Union, Callable
+from typing import List, Optional, Dict, Any, Union, Callable, TYPE_CHECKING
 from fastapi import WebSocket
-from datetime import datetime, timezone # <--- CORRECTION: Added timezone
+from datetime import datetime, timezone  # <--- CORRECTION: Added timezone
 from contextlib import asynccontextmanager
-from fastapi import WebSocket
 
 
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -24,10 +22,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, ConfigDict, ValidationInfo
 import uvicorn
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
+import uuid
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+)
 
 
-from config import get_settings, Settings
+from config import get_settings
 import jwt
 from jwt import PyJWTError
 
@@ -46,14 +54,20 @@ executor = ThreadPoolExecutor(max_workers=settings.db_pool_size)
 # Structured logging configuration
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('robot_api.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("robot_api.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
+
+# Helper: normalize numeric-like inputs to Decimal for internal arithmetic and mypy
+def to_decimal(v: Union[float, str, Decimal]) -> Decimal:
+    if isinstance(v, Decimal):
+        return v
+    return Decimal(str(v))
 
 
 # --- LIFESPAN MANAGEMENT ---
@@ -68,15 +82,18 @@ async def lifespan(app: FastAPI):
 
     # Optional MQTT client (for real-time notifications)
     app.state.mqtt_client = None
-    if getattr(settings, 'mqtt_enabled', False):
+    if getattr(settings, "mqtt_enabled", False):
         try:
             import paho.mqtt.client as mqtt
-            mqtt_client = mqtt.Client()
+
+            mqtt_client_local = mqtt.Client()
             # Use a short connect timeout; if broker unavailable we continue without MQ
-            mqtt_client.connect(settings.mqtt_host, settings.mqtt_port, keepalive=60)
-            mqtt_client.loop_start()
-            app.state.mqtt_client = mqtt_client
-            logger.info(f"[OK] MQTT client connected to {settings.mqtt_host}:{settings.mqtt_port}")
+            mqtt_client_local.connect(settings.mqtt_host, settings.mqtt_port, keepalive=60)
+            mqtt_client_local.loop_start()
+            app.state.mqtt_client = mqtt_client_local
+            logger.info(
+                f"[OK] MQTT client connected to {settings.mqtt_host}:{settings.mqtt_port}"
+            )
         except Exception as e:
             logger.warning(f"[WARN] MQTT client initialization failed: {e}")
 
@@ -88,7 +105,7 @@ async def lifespan(app: FastAPI):
         executor.shutdown(wait=True)
 
         # Stop MQTT loop if started
-        mqtt_client = getattr(app.state, 'mqtt_client', None)
+        mqtt_client: Any = getattr(app.state, "mqtt_client", None)
         if mqtt_client is not None:
             try:
                 mqtt_client.loop_stop()
@@ -97,23 +114,34 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.warning("[WARN] Error while disconnecting MQTT client")
 
-
             # cancel maintenance task if present
-            maint = getattr(app.state, 'db_maintenance_task', None)
+            maint = getattr(app.state, "db_maintenance_task", None)
             if maint is not None:
                 try:
                     maint.cancel()
                 except Exception:
                     pass
-
+            # Cancel any outstanding scheduled jobs
+            jobs = getattr(app.state, "job_registry", None)
+            if jobs:
+                for jid, meta in list(jobs.items()):
+                    try:
+                        ev = meta.get("stop_event")
+                        if ev:
+                            ev.set()
+                    except Exception:
+                        pass
 
 
 app = FastAPI(
     title="Wall-Finishing Robot Control API",
     version="2.0.0",
     description="Advanced path planning system for autonomous wall-finishing robots",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
+
+# In-process job registry for async plan submissions
+app.state.job_registry = {}
 
 
 def _require_api_key(request: Request):
@@ -122,17 +150,17 @@ def _require_api_key(request: Request):
     Accepts either `X-API-Key` header or `Authorization: Bearer <key>`.
     If `settings.api_key` is empty, no key is required (disabled).
     """
-    if not getattr(settings, 'api_key', None):
+    if not getattr(settings, "api_key", None):
         return True
 
-    key = request.headers.get('X-API-Key')
+    key = request.headers.get("X-API-Key")
     if not key:
-        auth = request.headers.get('authorization', '')
-        if auth.lower().startswith('bearer '):
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
             key = auth.split(None, 1)[1].strip()
 
     if not key or key != settings.api_key:
-        raise HTTPException(status_code=401, detail='Unauthorized')
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     return True
 
@@ -142,17 +170,20 @@ security = HTTPBearer(auto_error=False)
 
 def _verify_jwt_token(token: str) -> bool:
     """Verify JWT token using settings.jwt_secret if configured."""
-    secret = getattr(settings, 'jwt_secret', '')
+    secret = getattr(settings, "jwt_secret", "")
     if not secret:
         return False
     try:
-        payload = jwt.decode(token, secret, algorithms=['HS256'])
+        jwt.decode(token, secret, algorithms=["HS256"])
         return True
     except PyJWTError:
         return False
 
 
-def require_auth(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+def require_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Dependency to require either API key or valid JWT.
 
     Priority: API key via X-API-Key or Authorization: Bearer <key> matching settings.api_key.
@@ -166,12 +197,12 @@ def require_auth(request: Request, credentials: Optional[HTTPAuthorizationCreden
         pass
 
     # If a bearer token is present and jwt_secret configured, verify it
-    if credentials and credentials.scheme.lower() == 'bearer':
+    if credentials and credentials.scheme.lower() == "bearer":
         token = credentials.credentials
         if _verify_jwt_token(token):
             return True
 
-    raise HTTPException(status_code=401, detail='Unauthorized')
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def rate_limit_decorator(limit_spec: str):
@@ -179,31 +210,44 @@ def rate_limit_decorator(limit_spec: str):
 
     If no Redis limiter is configured, returns identity decorator.
     """
-    limiter_obj = getattr(app.state, 'limiter', None)
+    limiter_obj = getattr(app.state, "limiter", None)
     if limiter_obj is None:
+
         def _identity(fn):
             return fn
+
         return _identity
     return limiter_obj.limit(limit_spec)
 
 
 # Optional Redis-backed rate limiter (uses slowapi). Enabled when `settings.redis_url` is set.
-if getattr(settings, 'redis_url', ''):
+if getattr(settings, "redis_url", ""):
     try:
         from slowapi import Limiter
         from slowapi.util import get_remote_address
         from slowapi.errors import RateLimitExceeded
         from slowapi.middleware import SlowAPIMiddleware
-        from slowapi.errors import _rate_limit_exceeded_handler
+
+        # Some versions may not expose the named handler as an importable
+        # symbol; discover it at runtime to avoid static typing issues.
+        try:
+            import slowapi.errors as _slowapi_errors
+            _rate_limit_exceeded_handler = getattr(
+                _slowapi_errors, "_rate_limit_exceeded_handler", None
+            )
+        except Exception:
+            _rate_limit_exceeded_handler = None
 
         limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url)
         app.state.limiter = limiter
-        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        if _rate_limit_exceeded_handler is not None:
+            app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
         app.add_middleware(SlowAPIMiddleware)
-        logger.info(f"[OK] Redis-backed rate limiter initialized (redis: {settings.redis_url})")
+        logger.info(
+            f"[OK] Redis-backed rate limiter initialized (redis: {settings.redis_url})"
+        )
     except Exception as e:
         logger.warning(f"[WARN] Could not initialize Redis rate limiter: {e}")
-
 
 
 # --- PYDANTIC MODELS ---
@@ -211,23 +255,28 @@ if getattr(settings, 'redis_url', ''):
 
 class Obstacle(BaseModel):
     """Rectangular obstacle definition."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    
+
     id: str = Field(..., description="Unique obstacle identifier")
-    x: Union[float, str, Decimal] = Field(..., description="Bottom-left X coordinate (m)")
-    y: Union[float, str, Decimal] = Field(..., description="Bottom-left Y coordinate (m)")
+    x: Union[float, str, Decimal] = Field(
+        ..., description="Bottom-left X coordinate (m)"
+    )
+    y: Union[float, str, Decimal] = Field(
+        ..., description="Bottom-left Y coordinate (m)"
+    )
     width: Union[float, str, Decimal] = Field(..., description="Width (m)")
     height: Union[float, str, Decimal] = Field(..., description="Height (m)")
-    
-    @field_validator('x', 'y', 'width', 'height', mode='before')
+
+    @field_validator("x", "y", "width", "height", mode="before")
     @classmethod
     def convert_to_decimal(cls, v):
         """Convert input to Decimal."""
         if isinstance(v, Decimal):
             return v
         return Decimal(str(v))
-    
-    @field_validator('x', 'y', 'width', 'height')
+
+    @field_validator("x", "y", "width", "height")
     @classmethod
     def validate_positive(cls, v: Decimal) -> Decimal:
         if v < 0:
@@ -235,24 +284,26 @@ class Obstacle(BaseModel):
         return v
 
 
-
 class WallPlanRequest(BaseModel):
     """Path planning request schema."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    
+
     wall_width: Union[float, str, Decimal] = Field(..., description="Wall width (m)")
     wall_height: Union[float, str, Decimal] = Field(..., description="Wall height (m)")
     obstacles: List[Obstacle] = Field(default_factory=list, description="Obstacle list")
     tool_width: Union[float, str, Decimal] = Field(
         default=Decimal(str(settings.default_tool_width)),
-        description="Robot tool/brush width (m)"
+        description="Robot tool/brush width (m)",
     )
     coverage_margin: Union[float, str, Decimal] = Field(
         default=Decimal(str(settings.default_coverage_margin)),
-        description="Safety margin (m)"
+        description="Safety margin (m)",
     )
-    
-    @field_validator('wall_width', 'wall_height', 'tool_width', 'coverage_margin', mode='before')
+
+    @field_validator(
+        "wall_width", "wall_height", "tool_width", "coverage_margin", mode="before"
+    )
     @classmethod
     def convert_to_decimal(cls, v):
         """Convert input to Decimal."""
@@ -261,69 +312,73 @@ class WallPlanRequest(BaseModel):
         if v is None:
             return None
         return Decimal(str(v))
-    
-    @field_validator('wall_width', 'wall_height', 'tool_width')
+
+    @field_validator("wall_width", "wall_height", "tool_width")
     @classmethod
     def validate_positive(cls, v: Decimal) -> Decimal:
         if v <= 0:
             raise ValueError("Dimensions must be positive")
         return v
-    
-    @field_validator('coverage_margin')
+
+    @field_validator("coverage_margin")
     @classmethod
     def validate_non_negative(cls, v: Decimal) -> Decimal:
         if v < 0:
             raise ValueError("Margin must be non-negative")
         return v
 
-
-    @field_validator('obstacles')
+    @field_validator("obstacles")
     @classmethod
-    def validate_obstacles_within_wall(cls, obstacles: List[Obstacle], info: ValidationInfo) -> List[Obstacle]:
+    def validate_obstacles_within_wall(
+        cls, obstacles: List[Obstacle], info: ValidationInfo
+    ) -> List[Obstacle]:
         """Ensure all obstacles are within wall boundaries."""
         # Skip validation if wall dimensions aren't available yet
-        if 'wall_width' not in info.data or 'wall_height' not in info.data:
+        if "wall_width" not in info.data or "wall_height" not in info.data:
             return obstacles
-        
+
         # Get wall dimensions and ensure they're Decimals
-        w = info.data['wall_width']
-        h = info.data['wall_height']
-        
+        w = info.data["wall_width"]
+        h = info.data["wall_height"]
+
         if not isinstance(w, Decimal):
             w = Decimal(str(w))
         if not isinstance(h, Decimal):
             h = Decimal(str(h))
-        
+
         # Validate each obstacle
         for obs in obstacles:
-            # Get obstacle properties - they're already Decimals from the Obstacle validator
-            obs_x = obs.x
-            obs_y = obs.y
-            obs_width = obs.width
-            obs_height = obs.height
-            
+            # Get obstacle properties and normalize to Decimal for safe arithmetic
+            obs_x = to_decimal(obs.x)
+            obs_y = to_decimal(obs.y)
+            obs_width = to_decimal(obs.width)
+            obs_height = to_decimal(obs.height)
+
             # Check boundaries
             if obs_x + obs_width > w:
-                raise ValueError(f"Obstacle {obs.id} exceeds wall width (x: {obs_x} + width: {obs_width} = {obs_x + obs_width} > wall: {w})")
+                raise ValueError(
+                    f"Obstacle {obs.id} exceeds wall width (x: {obs_x} + width: {obs_width} = {obs_x + obs_width} > wall: {w})"
+                )
             if obs_y + obs_height > h:
-                raise ValueError(f"Obstacle {obs.id} exceeds wall height (y: {obs_y} + height: {obs_height} = {obs_y + obs_height} > wall: {h})")
-        
+                raise ValueError(
+                    f"Obstacle {obs.id} exceeds wall height (y: {obs_y} + height: {obs_height} = {obs_y + obs_height} > wall: {h})"
+                )
+
         return obstacles
-
-
 
 
 class PathMetrics(BaseModel):
     """Path statistics and metrics."""
+
     total_points: int
     total_distance_m: float
     estimated_time_min: float
     coverage_percentage: float
 
 
-
 class TrajectoryResponse(BaseModel):
     """Trajectory retrieval response."""
+
     id: int
     wall_width: float
     wall_height: float
@@ -335,14 +390,13 @@ class TrajectoryResponse(BaseModel):
     timestamp: str
 
 
-
 class HealthResponse(BaseModel):
     """Health check response."""
+
     status: str
     version: str
     database: str
     timestamp: str
-
 
 
 # --- DATABASE MANAGEMENT ---
@@ -351,29 +405,29 @@ class HealthResponse(BaseModel):
 def get_db_connection() -> sqlite3.Connection:
     """Create optimized SQLite connection."""
     conn = sqlite3.connect(settings.db_path, check_same_thread=False)
-    conn.execute('PRAGMA journal_mode = WAL')
-    conn.execute('PRAGMA synchronous = NORMAL')
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     # Use configurable cache_size (KB). Negative value instructs SQLite to use
     # page cache size in KB. Default is settings.cache_size (64000 KB -> ~64MB).
     try:
-        cache_kb = int(getattr(settings, 'cache_size', 64000))
+        cache_kb = int(getattr(settings, "cache_size", 64000))
         if cache_kb and cache_kb > 0:
-            conn.execute(f'PRAGMA cache_size = -{cache_kb}')
+            conn.execute(f"PRAGMA cache_size = -{cache_kb}")
     except Exception:
         # Fall back to a safe default
-        conn.execute('PRAGMA cache_size = -64000')
+        conn.execute("PRAGMA cache_size = -64000")
 
-    conn.execute('PRAGMA temp_store = MEMORY')
+    conn.execute("PRAGMA temp_store = MEMORY")
     # Ensure foreign keys cascade deletions for trajectory points
     try:
-        conn.execute('PRAGMA foreign_keys = ON')
+        conn.execute("PRAGMA foreign_keys = ON")
     except Exception:
         pass
     # Optional mmap_size (only set when explicitly configured > 0)
     try:
-        mmap_size = int(getattr(settings, 'mmap_size', 0))
+        mmap_size = int(getattr(settings, "mmap_size", 0))
         if mmap_size and mmap_size > 0:
-            conn.execute(f'PRAGMA mmap_size = {mmap_size}')
+            conn.execute(f"PRAGMA mmap_size = {mmap_size}")
     except Exception:
         # Ignore if unsupported on host
         pass
@@ -381,12 +435,218 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 
+# --- PROMETHEUS METRICS ---
+# Use a dedicated metrics registry so reloading / multiple imports don't attempt to
+# re-register the same timeseries into the global default registry (which raises
+# ValueError when duplicate names are created). This is important when running
+# under the development reloader or when the module is imported multiple times.
+metrics_registry = CollectorRegistry()
+
+# Count of plans created
+PLANS_CREATED = Counter(
+    "wfrs_plans_created_total", "Total number of plans created", registry=metrics_registry
+)
+# Histogram of plan generation duration (seconds)
+PLAN_GEN_TIME = Histogram(
+    "wfrs_plan_generation_seconds",
+    "Time to generate a plan (s)",
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 30, 60),
+    registry=metrics_registry,
+)
+# Active planner jobs gauge
+PLANNER_IN_PROGRESS = Gauge(
+    "wfrs_planners_in_progress", "Number of planner jobs currently running", registry=metrics_registry
+)
+# Gauge-like approximation using histogram count for queue depth not implemented; use custom metric if needed
+
+
+@app.get("/metrics")
+async def metrics():
+    """Expose Prometheus metrics from the app-local registry."""
+    data = generate_latest(registry=metrics_registry)
+    return JSONResponse(content=data.decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
+
+
+# --- JOBS: async/background plan submission ---
+class JobStatus(BaseModel):
+    id: str
+    status: str
+    submitted_at: str
+    finished_at: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+@app.post("/api/v1/jobs", status_code=202, tags=["Planning"])
+async def submit_plan_job(plan: WallPlanRequest, auth=Depends(require_auth)):
+    """Submit a plan job to run in background. Returns job id.
+
+    Use GET /api/v1/jobs/{job_id} to check status and POST /api/v1/jobs/{job_id}/cancel to cancel.
+    """
+    job_id = str(uuid.uuid4())
+    stop_event = threading.Event()
+    meta = {
+        "id": job_id,
+        "status": "queued",
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "result": None,
+        "error": None,
+        "stop_event": stop_event,
+    }
+    app.state.job_registry[job_id] = meta
+
+    loop = asyncio.get_running_loop()
+
+    def progress_cb(percent, points, batch=None):
+        # store lightweight progress
+        meta["status"] = "running"
+        meta["progress"] = {"percent": int(percent), "points": int(points)}
+
+    def job_runner():
+        PLANNER_IN_PROGRESS.inc()
+        try:
+            path, metrics = generate_coverage_path(plan, progress_callback=progress_cb, stop_event=stop_event)
+
+            # persist
+            traj_id = insert_trajectory_to_db(plan, path, metrics)
+
+            meta["status"] = "finished"
+            meta["finished_at"] = datetime.now(timezone.utc).isoformat()
+            meta["result"] = {"trajectory_id": traj_id, "metrics": metrics.model_dump()}
+            PLANS_CREATED.inc()
+        except Exception as e:
+            meta["status"] = "error"
+            meta["error"] = str(e)
+        finally:
+            PLANNER_IN_PROGRESS.dec()
+
+    # schedule in executor
+    fut = loop.run_in_executor(executor, job_runner)
+    meta["future"] = fut
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/v1/jobs/{job_id}", tags=["Planning"])
+async def get_job_status(job_id: str):
+    meta = app.state.job_registry.get(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Return serializable subset
+    out = {k: meta.get(k) for k in ("id", "status", "submitted_at", "finished_at", "result", "error")}
+    out["progress"] = meta.get("progress", {})
+    return out
+
+
+@app.post("/api/v1/jobs/{job_id}/cancel", tags=["Planning"])
+async def cancel_job(job_id: str):
+    meta = app.state.job_registry.get(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ev = meta.get("stop_event")
+    fut = meta.get("future")
+    if ev:
+        ev.set()
+    try:
+        if fut:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    meta["status"] = "cancelled"
+    meta["finished_at"] = datetime.now(timezone.utc).isoformat()
+    return {"job_id": job_id, "status": "cancelled"}
+
+
+def insert_trajectory_to_db(
+    plan: WallPlanRequest,
+    path: List[List[float]],
+    metrics: PathMetrics,
+    batch_size: int = 1000,
+) -> Optional[int]:
+    """Insert trajectory metadata and points into the DB and return the new id.
+    This centralizes the insertion logic so both REST and WS flows can persist results.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+
+        obstacles_json = json.dumps(
+            [obs.model_dump() for obs in plan.obstacles], default=str
+        )
+
+        # Detect legacy column as in create_plan
+        cursor.execute("PRAGMA table_info(trajectories)")
+        existing_cols = [r["name"] for r in cursor.fetchall()]
+
+        if "trajectory_points" in existing_cols:
+            cursor.execute(
+                """
+                INSERT INTO trajectories 
+                (wall_width, wall_height, obstacles, tool_width, coverage_margin, 
+                 total_distance, estimated_time, coverage_percentage, trajectory_points)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    float(plan.wall_width),
+                    float(plan.wall_height),
+                    obstacles_json,
+                    float(plan.tool_width),
+                    float(plan.coverage_margin),
+                    metrics.total_distance_m,
+                    metrics.estimated_time_min,
+                    metrics.coverage_percentage,
+                    json.dumps([]),
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO trajectories 
+                (wall_width, wall_height, obstacles, tool_width, coverage_margin, 
+                 total_distance, estimated_time, coverage_percentage)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    float(plan.wall_width),
+                    float(plan.wall_height),
+                    obstacles_json,
+                    float(plan.tool_width),
+                    float(plan.coverage_margin),
+                    metrics.total_distance_m,
+                    metrics.estimated_time_min,
+                    metrics.coverage_percentage,
+                ),
+            )
+
+        traj_id = cursor.lastrowid
+
+        # Batch insert points into trajectory_points table
+        if path:
+            points = [
+                (traj_id, idx, float(p[0]), float(p[1])) for idx, p in enumerate(path)
+            ]
+            for i in range(0, len(points), batch_size):
+                chunk = points[i : i + batch_size]
+                cursor.executemany(
+                    "INSERT INTO trajectory_points (trajectory_id, seq, x, y) VALUES (?, ?, ?, ?)",
+                    chunk,
+                )
+
+        conn.commit()
+        return traj_id
+    finally:
+        conn.close()
+
 
 def init_db():
     """Initialize database schema with optimized indexes."""
     conn = get_db_connection()
     try:
-        conn.execute('''
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS trajectories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 wall_width REAL NOT NULL,
@@ -399,10 +659,10 @@ def init_db():
                 coverage_percentage REAL,
                 timestamp TEXT DEFAULT CURRENT_TIMESTAMP
             );
-        ''')
+        """)
         # Separate table for trajectory points to allow batched inserts and smaller
         # read payloads. This helps performance when trajectories are large.
-        conn.execute('''
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS trajectory_points (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trajectory_id INTEGER NOT NULL,
@@ -411,30 +671,41 @@ def init_db():
                 y REAL NOT NULL,
                 FOREIGN KEY(trajectory_id) REFERENCES trajectories(id) ON DELETE CASCADE
             );
-        ''')
-        
+        """)
+
         # Optimized composite indexes
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_wall_dimensions ON trajectories (wall_width, wall_height);')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_desc ON trajectories (timestamp DESC);')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_tool_width ON trajectories (tool_width);')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_points_traj ON trajectory_points (trajectory_id, seq);')
-        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wall_dimensions ON trajectories (wall_width, wall_height);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timestamp_desc ON trajectories (timestamp DESC);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_width ON trajectories (tool_width);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_points_traj ON trajectory_points (trajectory_id, seq);"
+        )
+
         # Enable auto-vacuum
-        conn.execute('PRAGMA auto_vacuum = INCREMENTAL;')
+        conn.execute("PRAGMA auto_vacuum = INCREMENTAL;")
         conn.commit()
-        
+
         logger.info(f"[OK] Database initialized at {settings.db_path}")
+
         # Launch a background maintenance task to checkpoint WAL and periodically VACUUM
         def _maintenance_loop():
             conn = get_db_connection()
             try:
                 last_vacuum = time.time()
-                checkpoint_interval = getattr(settings, 'checkpoint_interval_seconds', 300)
-                vacuum_interval = getattr(settings, 'vacuum_interval_seconds', 3600)
+                checkpoint_interval = getattr(
+                    settings, "checkpoint_interval_seconds", 300
+                )
+                vacuum_interval = getattr(settings, "vacuum_interval_seconds", 3600)
                 while True:
                     try:
                         # WAL checkpoint
-                        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                         conn.commit()
                     except Exception:
                         pass
@@ -443,10 +714,10 @@ def init_db():
                     now_t = time.time()
                     if vacuum_interval and (now_t - last_vacuum) >= vacuum_interval:
                         try:
-                            conn.execute('VACUUM')
+                            conn.execute("VACUUM")
                             conn.commit()
                             last_vacuum = now_t
-                            logger.info('[MAINT] Performed VACUUM')
+                            logger.info("[MAINT] Performed VACUUM")
                         except Exception:
                             pass
 
@@ -457,8 +728,10 @@ def init_db():
 
         # Start maintenance task in background thread unless running under pytest
         try:
-            import threading, sys, os
-            if 'PYTEST_CURRENT_TEST' not in os.environ and 'pytest' not in sys.modules:
+            import sys
+            import os
+
+            if "PYTEST_CURRENT_TEST" not in os.environ and "pytest" not in sys.modules:
                 maint_thread = threading.Thread(target=_maintenance_loop, daemon=True)
                 maint_thread.start()
                 # Store thread in app state if available
@@ -476,28 +749,32 @@ def init_db():
         conn.close()
 
 
-
 # --- PATH PLANNING ALGORITHM ---
 
 
-def is_point_obstructed(x: Decimal, y: Decimal, obstacles: List[Obstacle], tool_radius: Decimal) -> bool:
+def is_point_obstructed(
+    x: Decimal, y: Decimal, obstacles: List[Obstacle], tool_radius: Decimal
+) -> bool:
     """Check if point collides with obstacle exclusion zone."""
     for obs in obstacles:
         # Ensure all values are Decimals
         obs_x = obs.x if isinstance(obs.x, Decimal) else Decimal(str(obs.x))
         obs_y = obs.y if isinstance(obs.y, Decimal) else Decimal(str(obs.y))
-        obs_width = obs.width if isinstance(obs.width, Decimal) else Decimal(str(obs.width))
-        obs_height = obs.height if isinstance(obs.height, Decimal) else Decimal(str(obs.height))
-        
+        obs_width = (
+            obs.width if isinstance(obs.width, Decimal) else Decimal(str(obs.width))
+        )
+        obs_height = (
+            obs.height if isinstance(obs.height, Decimal) else Decimal(str(obs.height))
+        )
+
         min_x = obs_x - tool_radius
         max_x = obs_x + obs_width + tool_radius
         min_y = obs_y - tool_radius
         max_y = obs_y + obs_height + tool_radius
-        
+
         if min_x <= x <= max_x and min_y <= y <= max_y:
             return True
     return False
-
 
 
 def calculate_path_metrics(path: List[List[float]], wall_area: float) -> PathMetrics:
@@ -507,33 +784,36 @@ def calculate_path_metrics(path: List[List[float]], wall_area: float) -> PathMet
             total_points=0,
             total_distance_m=0.0,
             estimated_time_min=0.0,
-            coverage_percentage=0.0
+            coverage_percentage=0.0,
         )
-    
+
     # Calculate total distance
     total_distance = 0.0
     for i in range(1, len(path)):
-        dx = path[i][0] - path[i-1][0]
-        dy = path[i][1] - path[i-1][1]
-        total_distance += (dx**2 + dy**2)**0.5
-    
+        dx = path[i][0] - path[i - 1][0]
+        dy = path[i][1] - path[i - 1][1]
+        total_distance += (dx**2 + dy**2) ** 0.5
+
     # Estimated time (assuming 0.5 m/s robot speed)
     robot_speed = 0.5  # m/s
     estimated_time = (total_distance / robot_speed) / 60  # minutes
-    
+
     # Coverage estimation (simplified)
     coverage_percentage = min(100.0, (len(path) * 0.001 / wall_area) * 100)
-    
+
     return PathMetrics(
         total_points=len(path),
         total_distance_m=round(total_distance, 2),
         estimated_time_min=round(estimated_time, 2),
-        coverage_percentage=round(coverage_percentage, 2)
+        coverage_percentage=round(coverage_percentage, 2),
     )
 
 
-
-def generate_coverage_path(plan: WallPlanRequest, progress_callback: Optional[Callable[[int, int], None]] = None) -> tuple[List[List[float]], PathMetrics]:
+def generate_coverage_path(
+    plan: WallPlanRequest,
+    progress_callback: Optional[Callable[..., Any]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> tuple[List[List[float]], PathMetrics]:
     """
     Generate optimized boustrophedon (snake) coverage path.
     Returns trajectory points and metrics.
@@ -542,11 +822,17 @@ def generate_coverage_path(plan: WallPlanRequest, progress_callback: Optional[Ca
     schedule into the event loop (e.g., loop.call_soon_threadsafe).
     """
     try:
+        # Helper to safely convert various numeric types to Decimal for mypy
+        def to_decimal(v: Union[float, str, Decimal]) -> Decimal:
+            if isinstance(v, Decimal):
+                return v
+            return Decimal(str(v))
+
         # Ensure all values are Decimals
-        W = plan.wall_width if isinstance(plan.wall_width, Decimal) else Decimal(str(plan.wall_width))
-        H = plan.wall_height if isinstance(plan.wall_height, Decimal) else Decimal(str(plan.wall_height))
-        T = plan.tool_width if isinstance(plan.tool_width, Decimal) else Decimal(str(plan.tool_width))
-        M = plan.coverage_margin if isinstance(plan.coverage_margin, Decimal) else Decimal(str(plan.coverage_margin))
+        W = to_decimal(plan.wall_width)
+        H = to_decimal(plan.wall_height)
+        T = to_decimal(plan.tool_width)
+        M = to_decimal(plan.coverage_margin)
 
         obstacles = plan.obstacles
 
@@ -555,36 +841,95 @@ def generate_coverage_path(plan: WallPlanRequest, progress_callback: Optional[Ca
 
         path: List[List[float]] = []
         current_x = M + tool_half
-        total_width = float((W - M - tool_half) - (M + tool_half)) if (W - 2*M - tool_half*2) > 0 else 0.0
+        total_width = (
+            float((W - M - tool_half) - (M + tool_half))
+            if (W - 2 * M - tool_half * 2) > 0
+            else 0.0
+        )
         point_counter = 0
+        # Batch for incremental point streaming to a progress callback
+        batch_emit_size = 200
+        batch_points: List[List[float]] = []
 
         while current_x < W - M - tool_half:
+            # Cooperative cancellation check
+            if stop_event is not None and stop_event.is_set():
+                logger.info("[PLANNER] Stop event set — aborting planner early.")
+                break
             # Alternate direction for snake pattern
             col_points = [p for p in path if abs(p[0] - float(current_x)) < 0.001]
             if len(col_points) % 2 == 0:
                 # Bottom to top
-                y_start, y_end, dy = (M + tool_half, H - M - tool_half, step_x / Decimal("4.0"))
+                y_start, y_end, dy = (
+                    M + tool_half,
+                    H - M - tool_half,
+                    step_x / Decimal("4.0"),
+                )
             else:
                 # Top to bottom
-                y_start, y_end, dy = (H - M - tool_half, M + tool_half, -step_x / Decimal("4.0"))
+                y_start, y_end, dy = (
+                    H - M - tool_half,
+                    M + tool_half,
+                    -step_x / Decimal("4.0"),
+                )
 
             current_y = y_start
 
             while (dy > 0 and current_y <= y_end) or (dy < 0 and current_y >= y_end):
+                # Periodically check for cancellation to exit promptly
+                if stop_event is not None and stop_event.is_set():
+                    logger.info(
+                        "[PLANNER] Stop event set inside column loop — exiting."
+                    )
+                    break
                 if not is_point_obstructed(current_x, current_y, obstacles, tool_half):
-                    path.append([float(current_x), float(current_y)])
+                    p = [float(current_x), float(current_y)]
+                    path.append(p)
                     point_counter += 1
-                    # report progress every 500 points
-                    if progress_callback and (point_counter % 500 == 0):
+                    # collect batch for streaming
+                    batch_points.append(p)
+                    if progress_callback and (len(batch_points) >= batch_emit_size):
                         try:
                             percent = 0
                             if total_width > 0:
-                                percent = int(((float(current_x) - float(M + tool_half)) / total_width) * 100)
+                                percent = int(
+                                    (
+                                        (float(current_x) - float(M + tool_half))
+                                        / total_width
+                                    )
+                                    * 100
+                                )
                                 percent = max(0, min(100, percent))
-                            progress_callback(percent, point_counter)
+                            # Try calling callback with three args (percent, total_points, batch)
+                            try:
+                                progress_callback(
+                                    percent, point_counter, batch_points.copy()
+                                )
+                            except TypeError:
+                                # Fallback to old two-arg style
+                                progress_callback(percent, point_counter)
+                            batch_points.clear()
                         except Exception:
                             pass
                 current_y += dy
+
+            # At the end of column handle any remaining batch_points
+            if progress_callback and batch_points:
+                try:
+                    percent = 0
+                    if total_width > 0:
+                        percent = int(
+                            ((float(current_x) - float(M + tool_half)) / total_width)
+                            * 100
+                        )
+                        percent = max(0, min(100, percent))
+                    try:
+                        progress_callback(percent, point_counter, batch_points.copy())
+                    except TypeError:
+                        progress_callback(percent, point_counter)
+                    batch_points.clear()
+                except Exception:
+                    pass
 
             current_x += step_x
 
@@ -592,7 +937,9 @@ def generate_coverage_path(plan: WallPlanRequest, progress_callback: Optional[Ca
         wall_area = float(W * H)
         metrics = calculate_path_metrics(path, wall_area)
 
-        logger.info(f"[OK] Path generated: {metrics.total_points} points, {metrics.total_distance_m}m")
+        logger.info(
+            f"[OK] Path generated: {metrics.total_points} points, {metrics.total_distance_m}m"
+        )
         return path, metrics
 
     except Exception as e:
@@ -611,21 +958,21 @@ async def websocket_plan(ws: WebSocket):
         return
 
     # Normalize payload keys (support both 'width' and 'wall_width')
-    if 'width' in payload and 'wall_width' not in payload:
-        payload['wall_width'] = payload.pop('width')
-    if 'height' in payload and 'wall_height' not in payload:
-        payload['wall_height'] = payload.pop('height')
+    if "width" in payload and "wall_width" not in payload:
+        payload["wall_width"] = payload.pop("width")
+    if "height" in payload and "wall_height" not in payload:
+        payload["wall_height"] = payload.pop("height")
 
     # Normalize obstacles
-    obs_list = payload.get('obstacles', [])
+    obs_list = payload.get("obstacles", [])
     normalized = []
     for o in obs_list:
-        if 'w' in o and 'width' not in o:
-            o['width'] = o.pop('w')
-        if 'h' in o and 'height' not in o:
-            o['height'] = o.pop('h')
+        if "w" in o and "width" not in o:
+            o["width"] = o.pop("w")
+        if "h" in o and "height" not in o:
+            o["height"] = o.pop("h")
         normalized.append(o)
-    payload['obstacles'] = normalized
+    payload["obstacles"] = normalized
 
     try:
         plan = WallPlanRequest(**payload)
@@ -638,42 +985,170 @@ async def websocket_plan(ws: WebSocket):
     progress_queue: asyncio.Queue = asyncio.Queue()
 
     # thread-safe callback to push progress into asyncio queue
-    def progress_cb(percent: int, points: int):
+    def progress_cb(*args):
+        """Adapter callback used by the planner thread.
+        Supports two forms:
+          - progress_cb(percent:int, points:int)
+          - progress_cb(percent:int, points:int, batch_points: List[List[float]])
+        """
         try:
-            loop.call_soon_threadsafe(progress_queue.put_nowait, {"type": "progress", "percent": percent, "points": points})
+            if len(args) == 2:
+                percent, points = args
+                loop.call_soon_threadsafe(
+                    progress_queue.put_nowait,
+                    {
+                        "type": "progress",
+                        "percent": int(percent),
+                        "points": int(points),
+                    },
+                )
+            elif len(args) == 3:
+                percent, points, batch = args
+                # send both a points batch and a progress message
+                if batch:
+                    loop.call_soon_threadsafe(
+                        progress_queue.put_nowait, {"type": "points", "points": batch}
+                    )
+                loop.call_soon_threadsafe(
+                    progress_queue.put_nowait,
+                    {
+                        "type": "progress",
+                        "percent": int(percent),
+                        "points": int(points),
+                    },
+                )
+            else:
+                # ignore unexpected forms
+                pass
         except Exception:
             pass
 
+    # Cooperative cancellation event for the planner thread
+    stop_event = threading.Event()
+
     def run_planner():
-        return generate_coverage_path(plan, progress_callback=progress_cb)
+        # Instrument planner job gauge when running in executor thread
+        PLANNER_IN_PROGRESS.inc()
+        try:
+            return generate_coverage_path(
+                plan, progress_callback=progress_cb, stop_event=stop_event
+            )
+        finally:
+            PLANNER_IN_PROGRESS.dec()
 
     planner_future = loop.run_in_executor(None, run_planner)
 
     try:
         while True:
             # wait for either planner completion or a progress item
+            get_task = asyncio.create_task(progress_queue.get())
             done, pending = await asyncio.wait(
-                [planner_future, asyncio.create_task(progress_queue.get())],
-                return_when=asyncio.FIRST_COMPLETED
+                [planner_future, get_task], return_when=asyncio.FIRST_COMPLETED
             )
 
+            # Planner finished first
             if planner_future in done:
-                path, metrics = planner_future.result()
-                await ws.send_json({"type": "result", "metrics": metrics.model_dump(), "path_points": len(path)})
+                try:
+                    # If the coroutine running this handler was cancelled earlier
+                    # (client disconnected), planner_future.result() may raise
+                    # CancelledError. Handle that gracefully.
+                    path, metrics = planner_future.result()
+                except asyncio.CancelledError:
+                    logger.info(
+                        "[WS] Planner future cancelled (likely client disconnect). Cleaning up."
+                    )
+                    try:
+                        planner_future.cancel()
+                    except Exception:
+                        pass
+                    break
+                except Exception as e:
+                    # Report planner error to client if possible and stop
+                    try:
+                        await ws.send_json(
+                            {"type": "error", "detail": f"Planning failed: {str(e)}"}
+                        )
+                    except Exception:
+                        pass
+                    break
+
+                # Persist the generated trajectory so clients can fetch it reliably
+                try:
+                    traj_id = await asyncio.to_thread(
+                        insert_trajectory_to_db, plan, path, metrics
+                    )
+                except Exception as e:
+                    # Send error back to client and include metrics as fallback
+                    try:
+                        await ws.send_json(
+                            {"type": "error", "detail": f"DB persist failed: {str(e)}"}
+                        )
+                    except Exception:
+                        pass
+                    traj_id = None
+
+                try:
+                    await ws.send_json(
+                        {
+                            "type": "result",
+                            "metrics": metrics.model_dump(),
+                            "path_points": len(path),
+                            "trajectory_id": traj_id,
+                        }
+                    )
+                except Exception:
+                    # If sending fails, client likely disconnected; just exit.
+                    pass
                 break
-            else:
-                for task in done:
-                    if task is not planner_future:
-                        msg = task.result()
-                        await ws.send_json(msg)
+
+            # Progress item ready
+            if get_task in done:
+                msg = get_task.result()
+                try:
+                    await ws.send_json(msg)
+                except Exception:
+                    # Sending failed (client closed); attempt to signal planner to stop and cancel
+                    try:
+                        stop_event.set()
+                    except Exception:
+                        pass
+                    try:
+                        planner_future.cancel()
+                    except Exception:
+                        pass
+                    break
+
+            # Cancel any leftover pending helper tasks
+            for p in pending:
+                try:
+                    p.cancel()
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        # The ASGI server cancelled this handler (client disconnected or shutdown).
+        logger.info(
+            "[WS] WebSocket handler cancelled by ASGI - cancelling planner future."
+        )
+        try:
+            # Signal planner thread to exit cooperatively
+            stop_event.set()
+        except Exception:
+            pass
+        try:
+            planner_future.cancel()
+        except Exception:
+            pass
+        # Do not re-raise to avoid unhandled exception logs; just return to cleanup.
     except Exception as e:
         try:
             await ws.send_json({"type": "error", "detail": str(e)})
         except Exception:
             pass
     finally:
-        await ws.close()
-
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 # --- MIDDLEWARE ---
@@ -682,25 +1157,29 @@ async def websocket_plan(ws: WebSocket):
 # lightweight for development/testing; for production use a redis-backed
 # limiter or a vetted library (e.g., `slowapi` with Redis/FastAPI integration).
 _rate_limits: Dict[str, List[float]] = {}
-RATE_LIMIT_WINDOW = getattr(settings, 'rate_limit_window_seconds', 60)
-RATE_LIMIT_MAX = getattr(settings, 'rate_limit_max_requests', 60)
+RATE_LIMIT_WINDOW = getattr(settings, "rate_limit_window_seconds", 60)
+RATE_LIMIT_MAX = getattr(settings, "rate_limit_max_requests", 60)
 
 
 @app.middleware("http")
 async def enforce_limits(request: Request, call_next):
     """Enforce request size and a simple per-IP rate limit."""
     # Request size limit (Content-Length) if provided
-    max_size = getattr(settings, 'max_request_size_bytes', 10 * 1024 * 1024)  # 10MB default
-    cl = request.headers.get('content-length')
+    max_size = getattr(
+        settings, "max_request_size_bytes", 10 * 1024 * 1024
+    )  # 10MB default
+    cl = request.headers.get("content-length")
     if cl:
         try:
             if int(cl) > max_size:
-                return JSONResponse(status_code=413, content={"detail": "Request payload too large"})
+                return JSONResponse(
+                    status_code=413, content={"detail": "Request payload too large"}
+                )
         except ValueError:
             pass
 
     # Rate limiting by client IP
-    client = request.client.host if request.client else 'unknown'
+    client = request.client.host if request.client else "unknown"
     now = time.time()
     window = _rate_limits.setdefault(client, [])
     # Remove timestamps outside window
@@ -734,7 +1213,6 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-
 # --- API ENDPOINTS ---
 
 
@@ -745,9 +1223,10 @@ async def root():
         "status": "operational",
         "version": "2.0.0",
         "database": settings.db_path,
-        "timestamp": datetime.now(timezone.utc).isoformat() # <--- CORRECTION: Changed datetime.UTC to timezone.utc
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),  # <--- CORRECTION: Changed datetime.UTC to timezone.utc
     }
-
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
@@ -762,109 +1241,117 @@ async def health_check():
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
         db_status = "error"
-    
+
     return {
         "status": "healthy" if db_status == "connected" else "degraded",
         "version": "2.0.0",
         "database": db_status,
-        "timestamp": datetime.now(timezone.utc).isoformat() # <--- CORRECTION: Changed datetime.utcnow() to timezone.utc
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),  # <--- CORRECTION: Changed datetime.utcnow() to timezone.utc
     }
 
 
+class TokenRequest(BaseModel):
+    api_key: str
 
-@app.post("/api/v1/plan", status_code=201, response_model=Dict[str, Any], tags=["Planning"])
+
+@app.post("/auth/token")
+async def issue_token(req: TokenRequest):
+    """Issue a short-lived JWT when the client presents the configured API key.
+
+    This is a convenience endpoint for dev/test. In production use proper
+    authentication flows (username/password, OAuth2, etc.).
+    """
+    configured = getattr(settings, "api_key", "")
+    jwt_secret = getattr(settings, "jwt_secret", "")
+    if not configured or not jwt_secret:
+        raise HTTPException(
+            status_code=400, detail="API key or JWT secret not configured"
+        )
+
+    if req.api_key != configured:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    payload = {
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,  # 1 hour expiry
+        "sub": "api-client",
+    }
+    token = jwt.encode(payload, jwt_secret, algorithm="HS256")
+    return {"access_token": token, "token_type": "bearer", "expires_in": 3600}
+
+
+@app.post(
+    "/api/v1/plan", status_code=201, response_model=Dict[str, Any], tags=["Planning"]
+)
 @rate_limit_decorator("10/minute")
 async def create_plan(plan: WallPlanRequest, auth=Depends(require_auth)):
     """
     Generate and store a coverage path plan.
-    
+
     - **wall_width**: Wall width in meters (positive)
     - **wall_height**: Wall height in meters (positive)
     - **obstacles**: List of rectangular obstacles
     - **tool_width**: Robot tool width in meters
     - **coverage_margin**: Safety margin from edges/obstacles
-    
+
     Returns the stored trajectory ID and metrics.
     """
-    # Generate path asynchronously
-    path, metrics = await asyncio.to_thread(generate_coverage_path, plan)
-    
-    # Store in database: insert trajectory metadata first, then batch-insert points.
-    def db_insert_batched(batch_size: int = 1000):
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
+    # Generate path asynchronously and time the operation for metrics
+    PLANNER_IN_PROGRESS.inc()
+    try:
+        with PLAN_GEN_TIME.time():
+            path, metrics = await asyncio.to_thread(generate_coverage_path, plan)
+    finally:
+        PLANNER_IN_PROGRESS.dec()
 
-            obstacles_json = json.dumps([obs.model_dump() for obs in plan.obstacles], default=str)
+    # Persist using central helper
+    new_id = await asyncio.to_thread(insert_trajectory_to_db, plan, path, metrics)
 
-            # Insert metadata into trajectories
-            cursor.execute(
-                """
-                INSERT INTO trajectories 
-                (wall_width, wall_height, obstacles, tool_width, coverage_margin, 
-                 total_distance, estimated_time, coverage_percentage)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    float(plan.wall_width),
-                    float(plan.wall_height),
-                    obstacles_json,
-                    float(plan.tool_width),
-                    float(plan.coverage_margin),
-                    metrics.total_distance_m,
-                    metrics.estimated_time_min,
-                    metrics.coverage_percentage
-                )
-            )
-            traj_id = cursor.lastrowid
-
-            # Prepare batched insertion of points
-            if path:
-                points = [(traj_id, idx, float(p[0]), float(p[1])) for idx, p in enumerate(path)]
-
-                for i in range(0, len(points), batch_size):
-                    chunk = points[i:i+batch_size]
-                    cursor.executemany(
-                        "INSERT INTO trajectory_points (trajectory_id, seq, x, y) VALUES (?, ?, ?, ?)",
-                        chunk
-                    )
-
-            conn.commit()
-            return traj_id
-        finally:
-            conn.close()
-
-    new_id = await asyncio.to_thread(db_insert_batched)
-    
+    PLANS_CREATED.inc()
     logger.info(f"[OK] Trajectory #{new_id} created successfully")
+
     # Publish event to MQTT broker if enabled
     try:
-        mqtt_client = getattr(app.state, 'mqtt_client', None)
+        mqtt_client = getattr(app.state, "mqtt_client", None)
         if mqtt_client is not None:
-            payload = json.dumps({
-                "id": new_id,
-                "metrics": metrics.model_dump(),
-                "wall_width": float(plan.wall_width),
-                "wall_height": float(plan.wall_height),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
+            payload = json.dumps(
+                {
+                    "id": new_id,
+                    "metrics": metrics.model_dump(),
+                    "wall_width": float(plan.wall_width),
+                    "wall_height": float(plan.wall_height),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             mqtt_client.publish(settings.mqtt_topic, payload)
-            logger.debug(f"[MQTT] Published trajectory #{new_id} to {settings.mqtt_topic}")
+            logger.debug(
+                f"[MQTT] Published trajectory #{new_id} to {settings.mqtt_topic}"
+            )
     except Exception as e:
-        logger.warning(f"[WARN] Failed to publish MQTT event for trajectory #{new_id}: {e}")
-    
+        logger.warning(
+            f"[WARN] Failed to publish MQTT event for trajectory #{new_id}: {e}"
+        )
+
     return {
         "id": new_id,
         "message": "Coverage plan generated and stored successfully",
-        "metrics": metrics.model_dump()
+        "metrics": metrics.model_dump(),
     }
 
 
+@app.get(
+    "/api/v1/trajectory/{plan_id}", response_model=TrajectoryResponse, tags=["Planning"]
+)
+async def get_trajectory(plan_id: int, limit: int = 10000, offset: int = 0):
+    """Retrieve a stored trajectory by ID.
 
-@app.get("/api/v1/trajectory/{plan_id}", response_model=TrajectoryResponse, tags=["Planning"])
-async def get_trajectory(plan_id: int):
-    """Retrieve a stored trajectory by ID."""
-    
+    Supports optional pagination of trajectory points via `limit` and `offset`.
+    The returned `metrics.total_points` contains the total stored point count
+    even when a subset of points is returned.
+    """
+
     def db_fetch():
         conn = get_db_connection()
         try:
@@ -874,38 +1361,72 @@ async def get_trajectory(plan_id: int):
             if row is None:
                 return None
 
-            # Fetch points separately and attach
-            cursor.execute("SELECT seq, x, y FROM trajectory_points WHERE trajectory_id = ? ORDER BY seq ASC", (plan_id,))
+            # Get total stored points count
+            cursor.execute(
+                "SELECT COUNT(*) as total FROM trajectory_points WHERE trajectory_id = ?",
+                (plan_id,),
+            )
+            total_pts = cursor.fetchone()["total"]
+
+            # Fetch a page of points separately and attach
+            cursor.execute(
+                "SELECT seq, x, y FROM trajectory_points WHERE trajectory_id = ? ORDER BY seq ASC LIMIT ? OFFSET ?",
+                (plan_id, limit, offset),
+            )
             pts = cursor.fetchall()
             # Convert sqlite rows into simple list of [x,y]
-            points = [[float(r['x']), float(r['y'])] for r in pts]
+            points = [[float(r["x"]), float(r["y"])] for r in pts]
 
-            # Return combined result as dict-like row
+            # Return combined result as dict-like row and include total points
             result = dict(row)
-            result['trajectory_points'] = points
+            result["trajectory_points"] = points
+            result["trajectory_points_total"] = int(total_pts)
             return result
         finally:
             conn.close()
-    
+
     row = await asyncio.to_thread(db_fetch)
-    
+
     if row is None:
         logger.warning(f"[WARN] Trajectory #{plan_id} not found")
         raise HTTPException(status_code=404, detail=f"Trajectory {plan_id} not found")
 
     data = row if isinstance(row, dict) else dict(row)
-    data['obstacles'] = json.loads(data['obstacles'])
-    
-    # Construct metrics
-    data['metrics'] = PathMetrics(
-        total_points=len(data['trajectory_points']),
-        total_distance_m=data.get('total_distance', 0.0) or 0.0,
-        estimated_time_min=data.get('estimated_time', 0.0) or 0.0,
-        coverage_percentage=data.get('coverage_percentage', 0.0) or 0.0
+    data["obstacles"] = json.loads(data["obstacles"])
+
+    # Construct metrics; ensure total_points reflects stored points count
+    total_points = int(data.get("trajectory_points_total", len(data["trajectory_points"])))
+    data["metrics"] = PathMetrics(
+        total_points=total_points,
+        total_distance_m=data.get("total_distance", 0.0) or 0.0,
+        estimated_time_min=data.get("estimated_time", 0.0) or 0.0,
+        coverage_percentage=data.get("coverage_percentage", 0.0) or 0.0,
     )
-    
+
     return data
 
+
+@app.get("/api/v1/trajectory/{plan_id}/points", tags=["Planning"])
+async def get_trajectory_points(plan_id: int, limit: int = 10000, offset: int = 0):
+    """Retrieve paginated trajectory points only (lightweight endpoint)."""
+
+    def db_fetch_points():
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) as total FROM trajectory_points WHERE trajectory_id = ?", (plan_id,))
+            total = cursor.fetchone()["total"]
+            cursor.execute(
+                "SELECT seq, x, y FROM trajectory_points WHERE trajectory_id = ? ORDER BY seq ASC LIMIT ? OFFSET ?",
+                (plan_id, limit, offset),
+            )
+            pts = cursor.fetchall()
+            points = [[float(r["x"]), float(r["y"])] for r in pts]
+            return {"points": points, "total": int(total), "limit": limit, "offset": offset}
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(db_fetch_points)
 
 
 @app.get("/api/v1/trajectories", tags=["Planning"])
@@ -913,39 +1434,44 @@ async def list_trajectories(
     limit: int = 10,
     offset: int = 0,
     min_width: Optional[float] = None,
-    max_width: Optional[float] = None
+    max_width: Optional[float] = None,
+    after_id: Optional[int] = None,
 ):
     """
     List recent trajectories with optional filtering.
-    
+
     - **limit**: Maximum number of results (default: 10)
     - **offset**: Pagination offset (default: 0)
     - **min_width**: Filter by minimum wall width
     - **max_width**: Filter by maximum wall width
     """
-    
+
     def db_fetch_all():
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            
+
             query = "SELECT id, wall_width, wall_height, total_distance, timestamp FROM trajectories WHERE 1=1"
             params = []
-            
+
             if min_width is not None:
                 query += " AND wall_width >= ?"
                 params.append(min_width)
-            
+
             if max_width is not None:
                 query += " AND wall_width <= ?"
                 params.append(max_width)
-            
+
+            # Support cursor-style pagination via after_id (fetch items with id < after_id)
+            if after_id is not None:
+                query += " AND id < ?"
+                params.append(after_id)
             query += " ORDER BY id DESC LIMIT ? OFFSET ?"
             params.extend([limit, offset])
-            
+
             cursor.execute(query, params)
             rows = cursor.fetchall()
-            
+
             # Get total count
             count_query = "SELECT COUNT(*) as total FROM trajectories WHERE 1=1"
             count_params = []
@@ -955,32 +1481,31 @@ async def list_trajectories(
             if max_width is not None:
                 count_query += " AND wall_width <= ?"
                 count_params.append(max_width)
-            
+
             cursor.execute(count_query, count_params)
-            total = cursor.fetchone()['total']
-            
+            total = cursor.fetchone()["total"]
+
             return [dict(row) for row in rows], total
         finally:
             conn.close()
-    
+
     plans, total = await asyncio.to_thread(db_fetch_all)
-    
+
     return {
         "plans": plans,
         "count": len(plans),
         "total": total,
         "limit": limit,
         "offset": offset,
-        "has_more": (offset + len(plans)) < total
+        "has_more": (offset + len(plans)) < total,
     }
-
 
 
 @app.delete("/api/v1/trajectory/{plan_id}", status_code=204, tags=["Planning"])
 @rate_limit_decorator("20/minute")
 async def delete_trajectory(plan_id: int, auth=Depends(require_auth)):
     """Delete a trajectory by ID."""
-    
+
     def db_delete():
         conn = get_db_connection()
         try:
@@ -991,15 +1516,14 @@ async def delete_trajectory(plan_id: int, auth=Depends(require_auth)):
             return deleted
         finally:
             conn.close()
-    
+
     deleted = await asyncio.to_thread(db_delete)
-    
+
     if deleted == 0:
         raise HTTPException(status_code=404, detail=f"Trajectory {plan_id} not found")
-    
+
     logger.info(f"[DELETE] Trajectory #{plan_id} deleted")
     return None
-
 
 
 # --- CORS CONFIGURATION ---
@@ -1021,7 +1545,6 @@ except Exception as e:
     logger.warning(f"Static files directory not found: {e}")
 
 
-
 # --- MAIN RUNNER ---
 
 
@@ -1033,5 +1556,5 @@ if __name__ == "__main__":
         port=settings.api_port,
         reload=True,
         workers=1,  # Use 1 for development, settings.api_workers for production
-        log_level=settings.log_level.lower()
+        log_level=settings.log_level.lower(),
     )

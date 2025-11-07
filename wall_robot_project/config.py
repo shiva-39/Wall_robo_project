@@ -3,6 +3,7 @@
 This file uses pydantic-settings' SettingsConfigDict via `model_config` to avoid
 deprecated Field kwargs such as `env=` and the class-based Config.
 """
+
 from functools import lru_cache
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -42,13 +43,20 @@ class Settings(BaseSettings):
     mqtt_host: str = "127.0.0.1"
     mqtt_port: int = 1883
     mqtt_topic: str = "robot/trajectories"
-    
+
     # Security
-    api_key: str = ""  # If set, write endpoints require this API key via X-API-Key or Bearer token
-    
+    api_key: str = (
+        ""  # If set, write endpoints require this API key via X-API-Key or Bearer token
+    )
+
     # DB maintenance
     checkpoint_interval_seconds: int = 300  # how often to run WAL checkpoint (seconds)
     vacuum_interval_seconds: int = 3600  # how often to run VACUUM (seconds)
+    # Optional Redis URL for distributed rate-limiting (e.g., redis://localhost:6379/0)
+    redis_url: str = ""
+    # JWT authentication (optional)
+    jwt_secret: str = ""
+    jwt_exp_minutes: int = 60
 
     @property
     def cors_origins_list(self) -> List[str]:

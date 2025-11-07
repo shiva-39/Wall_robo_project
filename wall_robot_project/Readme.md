@@ -74,6 +74,10 @@ Open `static/index.html` in your browser or visit the server UI if static files 
 - `GET /api/v1/trajectory/{id}` — return stored trajectory (points + metrics)
 - `GET /api/v1/trajectories` — list stored trajectories
 - `DELETE /api/v1/trajectory/{id}` — delete trajectory
+ - `POST /api/v1/jobs` — submit an async/background plan job (returns job_id)
+ - `GET /api/v1/jobs/{job_id}` — check status and progress of background job
+ - `POST /api/v1/jobs/{job_id}/cancel` — cancel a running background job
+ - `GET /metrics` — Prometheus metrics endpoint (scrape by Prometheus)
 
 Example (PowerShell - recommended):
 
@@ -127,6 +131,8 @@ __pycache__/
 ## Development & Extras
 
 - MQTT publishing is optional and disabled by default — enable via config when you have a broker.
+ - Background job submission via `/api/v1/jobs` allows long-running plans to run asynchronously and be cancelled.
+ - Metrics: Prometheus `prometheus_client` is integrated and `/metrics` exposes counters and histograms for plan generation.
 - If you want CI (GitHub Actions) to run tests on push/PR I can add a workflow.
 
 ## Support
