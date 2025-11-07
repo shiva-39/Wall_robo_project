@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     mqtt_host: str = "127.0.0.1"
     mqtt_port: int = 1883
     mqtt_topic: str = "robot/trajectories"
+    
+    # Security
+    api_key: str = ""  # If set, write endpoints require this API key via X-API-Key or Bearer token
+    
+    # DB maintenance
+    checkpoint_interval_seconds: int = 300  # how often to run WAL checkpoint (seconds)
+    vacuum_interval_seconds: int = 3600  # how often to run VACUUM (seconds)
 
     @property
     def cors_origins_list(self) -> List[str]:

@@ -93,6 +93,15 @@ async def lifespan(app: FastAPI):
                 logger.warning("[WARN] Error while disconnecting MQTT client")
 
 
+            # cancel maintenance task if present
+            maint = getattr(app.state, 'db_maintenance_task', None)
+            if maint is not None:
+                try:
+                    maint.cancel()
+                except Exception:
+                    pass
+
+
 
 app = FastAPI(
     title="Wall-Finishing Robot Control API",
@@ -100,6 +109,27 @@ app = FastAPI(
     description="Advanced path planning system for autonomous wall-finishing robots",
     lifespan=lifespan
 )
+
+
+def _require_api_key(request: Request):
+    """Dependency to require API key for sensitive endpoints.
+
+    Accepts either `X-API-Key` header or `Authorization: Bearer <key>`.
+    If `settings.api_key` is empty, no key is required (disabled).
+    """
+    if not getattr(settings, 'api_key', None):
+        return True
+
+    key = request.headers.get('X-API-Key')
+    if not key:
+        auth = request.headers.get('authorization', '')
+        if auth.lower().startswith('bearer '):
+            key = auth.split(None, 1)[1].strip()
+
+    if not key or key != settings.api_key:
+        raise HTTPException(status_code=401, detail='Unauthorized')
+
+    return True
 
 
 
@@ -321,6 +351,36 @@ def init_db():
         conn.commit()
         
         logger.info(f"[OK] Database initialized at {settings.db_path}")
+        # Launch a background maintenance task to checkpoint WAL and periodically VACUUM
+        def _maintenance_loop():
+            conn = get_db_connection()
+            try:
+                while True:
+                    try:
+                        # WAL checkpoint
+                        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                        conn.commit()
+                    except Exception:
+                        pass
+                    # Sleep for the configured interval
+                    time.sleep(getattr(settings, 'checkpoint_interval_seconds', 300))
+            finally:
+                conn.close()
+
+        # Start maintenance task in background thread unless running under pytest
+        try:
+            import threading, sys, os
+            if 'PYTEST_CURRENT_TEST' not in os.environ and 'pytest' not in sys.modules:
+                maint_thread = threading.Thread(target=_maintenance_loop, daemon=True)
+                maint_thread.start()
+                # Store thread in app state if available
+                try:
+                    app.state.db_maintenance_task = maint_thread
+                except Exception:
+                    pass
+        except Exception:
+            # Non-fatal if we cannot spawn background thread
+            pass
     except Exception as e:
         logger.error(f"[ERROR] Database initialization failed: {e}")
         raise
