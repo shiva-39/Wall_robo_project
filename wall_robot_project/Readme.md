@@ -75,18 +75,21 @@ Open `static/index.html` in your browser or visit the server UI if static files 
 - `GET /api/v1/trajectories` — list stored trajectories
 - `DELETE /api/v1/trajectory/{id}` — delete trajectory
 
-Example (PowerShell/curl):
+Example (PowerShell - recommended):
 
 ```powershell
-curl -X POST http://127.0.0.1:8000/api/v1/plan -H "Content-Type: application/json" -d @- <<'JSON'
+$json = @'
 {
-	"width": 5,
-	"height": 5,
-	"tool_width": 0.25,
-	"margin": 0.02,
-	"obstacles": [ { "x": 2, "y": 2, "w": 0.25, "h": 0.25 } ]
+  "width": 5,
+  "height": 5,
+  "tool_width": 0.25,
+  "margin": 0.02,
+  "obstacles": [ { "id": "win1", "x": 2, "y": 2, "width": 0.25, "height": 0.25 } ]
 }
-JSON
+'@
+
+$resp = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/plan" -Method Post -ContentType "application/json" -Body $json
+$resp | Format-List
 ```
 
 ## Testing
@@ -97,16 +100,19 @@ Run tests inside the activated venv:
 pytest -q
 ```
 
-The test suite included in this workspace verifies API behavior, validation, and DB persistence.
+The test suite included in this workspace verifies API behavior, validation, and DB persistence. Current tests: 18 passing.
 
 ## Database
 
-The app persists trajectories to a local SQLite file `robot_trajectories.db`. This file is created on first write.
+The app persists trajectories to a local SQLite file `robot_trajectories.db`. To improve performance and avoid very large JSON payloads, trajectory points are stored in a separate `trajectory_points` table and are inserted in batches.
 
 Configuration notes:
 
 - PRAGMA tunables (cache_size, optional mmap_size) are configurable in `config.py` or via environment variables.
 - The project ships with sensible defaults; large mmap values are not used by default to remain portable.
+ - The project ships with sensible defaults; large mmap values are not used by default to remain portable.
+
+CI: A GitHub Actions workflow has been added at `.github/workflows/python-tests.yml` to run linting (ruff), type-checking (mypy) and tests on pushes/PRs.
 
 ## Recommended .gitignore
 
