@@ -311,10 +311,10 @@ def init_db():
         ''')
         
         # Optimized composite indexes
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_wall_dimensions ON trajectories (wall_width, wall_height);')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_desc ON trajectories (timestamp DESC);')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_tool_width ON trajectories (tool_width);')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_points_traj ON trajectory_points (trajectory_id, seq);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_wall_dimensions ON trajectories (wall_width, wall_height);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_desc ON trajectories (timestamp DESC);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tool_width ON trajectories (tool_width);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_points_traj ON trajectory_points (trajectory_id, seq);')
         
         # Enable auto-vacuum
         conn.execute('PRAGMA auto_vacuum = INCREMENTAL;')
