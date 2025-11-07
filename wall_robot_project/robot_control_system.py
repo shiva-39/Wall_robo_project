@@ -261,6 +261,11 @@ def get_db_connection() -> sqlite3.Connection:
         conn.execute('PRAGMA cache_size = -64000')
 
     conn.execute('PRAGMA temp_store = MEMORY')
+    # Ensure foreign keys cascade deletions for trajectory points
+    try:
+        conn.execute('PRAGMA foreign_keys = ON')
+    except Exception:
+        pass
     # Optional mmap_size (only set when explicitly configured > 0)
     try:
         mmap_size = int(getattr(settings, 'mmap_size', 0))
@@ -286,18 +291,30 @@ def init_db():
                 obstacles TEXT NOT NULL,
                 tool_width REAL NOT NULL,
                 coverage_margin REAL NOT NULL,
-                trajectory_points TEXT NOT NULL,
                 total_distance REAL,
                 estimated_time REAL,
                 coverage_percentage REAL,
                 timestamp TEXT DEFAULT CURRENT_TIMESTAMP
             );
         ''')
+        # Separate table for trajectory points to allow batched inserts and smaller
+        # read payloads. This helps performance when trajectories are large.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS trajectory_points (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trajectory_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                FOREIGN KEY(trajectory_id) REFERENCES trajectories(id) ON DELETE CASCADE
+            );
+        ''')
         
         # Optimized composite indexes
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_wall_dimensions ON trajectories (wall_width, wall_height);')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_desc ON trajectories (timestamp DESC);')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_tool_width ON trajectories (tool_width);')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_wall_dimensions ON trajectories (wall_width, wall_height);')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_desc ON trajectories (timestamp DESC);')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_tool_width ON trajectories (tool_width);')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_points_traj ON trajectory_points (trajectory_id, seq);')
         
         # Enable auto-vacuum
         conn.execute('PRAGMA auto_vacuum = INCREMENTAL;')
@@ -423,24 +440,59 @@ def generate_coverage_path(plan: WallPlanRequest) -> tuple[List[List[float]], Pa
 
 # --- MIDDLEWARE ---
 
+# Simple in-memory rate limiter (per-IP sliding window). This is intentionally
+# lightweight for development/testing; for production use a redis-backed
+# limiter or a vetted library (e.g., `slowapi` with Redis/FastAPI integration).
+_rate_limits: Dict[str, List[float]] = {}
+RATE_LIMIT_WINDOW = getattr(settings, 'rate_limit_window_seconds', 60)
+RATE_LIMIT_MAX = getattr(settings, 'rate_limit_max_requests', 60)
+
+
+@app.middleware("http")
+async def enforce_limits(request: Request, call_next):
+    """Enforce request size and a simple per-IP rate limit."""
+    # Request size limit (Content-Length) if provided
+    max_size = getattr(settings, 'max_request_size_bytes', 10 * 1024 * 1024)  # 10MB default
+    cl = request.headers.get('content-length')
+    if cl:
+        try:
+            if int(cl) > max_size:
+                return JSONResponse(status_code=413, content={"detail": "Request payload too large"})
+        except ValueError:
+            pass
+
+    # Rate limiting by client IP
+    client = request.client.host if request.client else 'unknown'
+    now = time.time()
+    window = _rate_limits.setdefault(client, [])
+    # Remove timestamps outside window
+    while window and window[0] <= now - RATE_LIMIT_WINDOW:
+        window.pop(0)
+    if len(window) >= RATE_LIMIT_MAX:
+        # Too many requests
+        return JSONResponse(status_code=429, content={"detail": "Too many requests"})
+    window.append(now)
+
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Log all requests with timing information."""
     start_time = time.time()
-    
+
     response = await call_next(request)
-    
+
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = f"{process_time:.4f}"
-    
+
     logger.info(
         f"[REQUEST] {request.method} {request.url.path} | "
         f"Status: {response.status_code} | "
         f"Time: {process_time:.4f}s | "
         f"Client: {request.client.host if request.client else 'unknown'}"
     )
-    
+
     return response
 
 
@@ -498,20 +550,21 @@ async def create_plan(plan: WallPlanRequest):
     # Generate path asynchronously
     path, metrics = await asyncio.to_thread(generate_coverage_path, plan)
     
-    # Store in database
-    def db_insert():
+    # Store in database: insert trajectory metadata first, then batch-insert points.
+    def db_insert_batched(batch_size: int = 1000):
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            
+
             obstacles_json = json.dumps([obs.model_dump() for obs in plan.obstacles], default=str)
-            
+
+            # Insert metadata into trajectories
             cursor.execute(
                 """
                 INSERT INTO trajectories 
                 (wall_width, wall_height, obstacles, tool_width, coverage_margin, 
-                 trajectory_points, total_distance, estimated_time, coverage_percentage)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 total_distance, estimated_time, coverage_percentage)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     float(plan.wall_width),
@@ -519,18 +572,30 @@ async def create_plan(plan: WallPlanRequest):
                     obstacles_json,
                     float(plan.tool_width),
                     float(plan.coverage_margin),
-                    json.dumps(path),
                     metrics.total_distance_m,
                     metrics.estimated_time_min,
                     metrics.coverage_percentage
                 )
             )
+            traj_id = cursor.lastrowid
+
+            # Prepare batched insertion of points
+            if path:
+                points = [(traj_id, idx, float(p[0]), float(p[1])) for idx, p in enumerate(path)]
+
+                for i in range(0, len(points), batch_size):
+                    chunk = points[i:i+batch_size]
+                    cursor.executemany(
+                        "INSERT INTO trajectory_points (trajectory_id, seq, x, y) VALUES (?, ?, ?, ?)",
+                        chunk
+                    )
+
             conn.commit()
-            return cursor.lastrowid
+            return traj_id
         finally:
             conn.close()
-    
-    new_id = await asyncio.to_thread(db_insert)
+
+    new_id = await asyncio.to_thread(db_insert_batched)
     
     logger.info(f"[OK] Trajectory #{new_id} created successfully")
     # Publish event to MQTT broker if enabled
@@ -566,7 +631,20 @@ async def get_trajectory(plan_id: int):
         try:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM trajectories WHERE id = ?", (plan_id,))
-            return cursor.fetchone()
+            row = cursor.fetchone()
+            if row is None:
+                return None
+
+            # Fetch points separately and attach
+            cursor.execute("SELECT seq, x, y FROM trajectory_points WHERE trajectory_id = ? ORDER BY seq ASC", (plan_id,))
+            pts = cursor.fetchall()
+            # Convert sqlite rows into simple list of [x,y]
+            points = [[float(r['x']), float(r['y'])] for r in pts]
+
+            # Return combined result as dict-like row
+            result = dict(row)
+            result['trajectory_points'] = points
+            return result
         finally:
             conn.close()
     
@@ -575,10 +653,9 @@ async def get_trajectory(plan_id: int):
     if row is None:
         logger.warning(f"[WARN] Trajectory #{plan_id} not found")
         raise HTTPException(status_code=404, detail=f"Trajectory {plan_id} not found")
-    
-    data = dict(row)
+
+    data = row if isinstance(row, dict) else dict(row)
     data['obstacles'] = json.loads(data['obstacles'])
-    data['trajectory_points'] = json.loads(data['trajectory_points'])
     
     # Construct metrics
     data['metrics'] = PathMetrics(

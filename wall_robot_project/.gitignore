@@ -7,6 +7,12 @@
 *.db-shm
 *.db-wal
 
+# Virtual env
+venv/
+
+# Logs
+robot_api.log
+
 # Python
 __pycache__/
 *.py[cod]
